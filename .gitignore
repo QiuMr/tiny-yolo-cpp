@@ -1,0 +1,57 @@
+# Build
+*.obj
+*.o
+*.lib
+*.exp
+*.ilk
+*.pdb
+*.iobj
+*.ipdb
+vc140.pdb
+x64/
+Debug/
+Release/
+out/
+
+# DLLs (按需保留发布版，其余忽略)
+# tiny_yolo.dll
+# tiny_yolo_x86.dll
+
+# Models - 建议用 Git LFS 或 Release 附件托管
+*.onnx
+*.tyro
+*.bin
+
+# Test artifacts
+test_*.exe
+*_x64.exe
+*.log
+mat_*.txt
+prof*.txt
+output*.txt
+result.jpg
+dbg_*.bin
+engine_output.bin
+
+# Temp / IDE
+.vs/
+.vscode/
+*.user
+*.suo
+*.sdf
+*.VC.db
+*.VC.opendb
+__pycache__/
+*.py[cod]
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Backup
+backup_*/
+tiny_yolo_ref/
+tiny_yolo_backup.dll
+*.tmp

@@ -1,0 +1,5 @@
+LIBRARY "winml_yolo"
+EXPORTS
+    InitModel
+    YoloDetect
+    ReleaseModel
