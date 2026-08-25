@@ -535,6 +535,88 @@ static inline void gemm_nm_core(const float* X, const float* W, const float* bia
     }
 }
 
+// W 打包缓存：把 W[N,K] 预排为 [K][N/6][6] 连续块，FMA 时 6 个通道值连续命中同一缓存行
+struct PackedW { std::vector<float> data; int N = 0, K = 0; };
+static std::unordered_map<const void*, PackedW> g_packedW;
+static std::mutex g_packedW_mtx;
+
+static inline const float* get_packed_W(const float* W, int N, int K) {
+    if (N % 6 != 0 || K < 32) return nullptr; // 仅对大 K 且 N 为 6 倍数的 1x1 卷积打包
+    std::lock_guard<std::mutex> lk(g_packedW_mtx);
+    auto it = g_packedW.find(W);
+    if (it != g_packedW.end() && it->second.N == N && it->second.K == K) return it->second.data.data();
+    PackedW pw; pw.N = N; pw.K = K;
+    pw.data.resize((size_t)K * N);
+    // 布局: pw[k*N + n] -> 原 W[n*K + k] 按 k 外层、n 连续重排为 6 通道块内连续
+    // 实际按 [K][nb][6]：k*Nb*6 + nb*6 + i
+    int nb = N / 6;
+    for (int k = 0; k < K; k++) {
+        for (int b = 0; b < nb; b++) {
+            for (int i = 0; i < 6; i++) {
+                pw.data[(size_t)k * N + b * 6 + i] = W[(b * 6 + i) * K + k];
+            }
+        }
+    }
+    auto res = g_packedW.emplace(W, std::move(pw));
+    return res.first->second.data.data();
+}
+
+static inline void gemm_nm_packed_core(const float* X, const float* Wp, const float* bias,
+                                        float* Out, int N, int M, int K, bool silu,
+                                        int m0, int m1) {
+    // Wp 已打包为 [K][N] 转置连续：Wp[k*N + n]
+    int nb = N / 6;
+    for (int b = 0; b < nb; b++) {
+        float* o0 = Out + (size_t)(b * 6) * M;
+        int m = m0;
+        for (; m + 7 < m1; m += 8) {
+            __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+            __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
+            const float* xk = X + m;
+            const float* wpk = Wp + b * 6;
+            for (int k = 0; k < K; k++, xk += M, wpk += N) {
+                __m256 xv = _mm256_loadu_ps(xk);
+                // 6 个通道值连续，广播各自通道
+                acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(wpk + 0), xv, acc0);
+                acc1 = _mm256_fmadd_ps(_mm256_broadcast_ss(wpk + 1), xv, acc1);
+                acc2 = _mm256_fmadd_ps(_mm256_broadcast_ss(wpk + 2), xv, acc2);
+                acc3 = _mm256_fmadd_ps(_mm256_broadcast_ss(wpk + 3), xv, acc3);
+                acc4 = _mm256_fmadd_ps(_mm256_broadcast_ss(wpk + 4), xv, acc4);
+                acc5 = _mm256_fmadd_ps(_mm256_broadcast_ss(wpk + 5), xv, acc5);
+            }
+            __m256 vones = _mm256_set1_ps(1.0f);
+            __m256 vs[6] = {acc0, acc1, acc2, acc3, acc4, acc5};
+            for (int i = 0; i < 6; i++) {
+                __m256 v = vs[i];
+                if (bias) v = _mm256_add_ps(v, _mm256_set1_ps(bias[b * 6 + i]));
+                if (silu) {
+                    __m256 t = _mm256_sub_ps(_mm256_setzero_ps(), v);
+                    t = _mm256_min_ps(t, _mm256_set1_ps(88.0f));
+                    t = _mm256_max_ps(t, _mm256_set1_ps(-88.0f));
+                    t = _mm256_fmadd_ps(t, _mm256_set1_ps(12102203.0f), _mm256_set1_ps(1064866805.0f));
+                    __m256 ex = _mm256_castsi256_ps(_mm256_cvttps_epi32(t));
+                    v = _mm256_div_ps(v, _mm256_add_ps(vones, ex));
+                }
+                _mm256_storeu_ps(o0 + (size_t)i * M + m, v);
+            }
+        }
+        for (; m < m1; m++) {
+            float s[6] = {0,0,0,0,0,0};
+            for (int k = 0; k < K; k++) {
+                float xv = X[(size_t)k * M + m];
+                const float* wpk = Wp + (size_t)k * N + b * 6;
+                for (int i = 0; i < 6; i++) s[i] += wpk[i] * xv;
+            }
+            for (int i = 0; i < 6; i++) {
+                float v = s[i] + (bias ? bias[b * 6 + i] : 0.0f);
+                if (silu) v = v / (1.0f + fast_exp(-v));
+                o0[(size_t)i * M + m] = v;
+            }
+        }
+    }
+}
+
 static inline void gemm_nm(const float* X, const float* W, const float* bias,
                             float* Out, int N, int M, int K, bool silu = false) {
     long long macs = (long long)N * M * K;
@@ -544,14 +626,16 @@ static inline void gemm_nm(const float* X, const float* W, const float* bias,
         return;
     }
 
-    // 分块策略（二维：通道块 × M 块）：
-    // - X 很大（超过 L2）时通道块保持 6，减少 X 的重复遍历次数
-    //   （总流量 = 通道块数 × X大小，细分通道会成倍放大内存带宽压力）
-    // - 任务数不足时优先在 M 方向补充切分（各任务读写区间完全独立）
+    // 尝试 W 打包路径（大 K 且 N 为 6 倍数时命中）
+    const float* Wp = nullptr;
+    if (N % 6 == 0 && K >= 32) Wp = get_packed_W(W, N, K);
+
     size_t xbytes = (size_t)K * M * sizeof(float);
     int CH = 6;
-    if (xbytes <= (2u << 20)) {
+    if (!Wp && xbytes <= (2u << 20)) {
         while (CH > 1 && (N + CH - 1) / CH < workers * 2) CH--;
+    } else if (Wp) {
+        CH = 6; // 打包路径固定 6 通道块
     }
     int nb = (N + CH - 1) / CH;
     int mb = 1;
@@ -560,7 +644,26 @@ static inline void gemm_nm(const float* X, const float* W, const float* bias,
     int m_blocks = (M + m_chunk - 1) / m_chunk;
     int tasks = nb * m_blocks;
     if (tasks <= 1) {
-        gemm_nm_core(X, W, bias, Out, N, M, K, silu);
+        if (Wp) {
+            // 打包路径需按 6 通道块切分时单独处理
+            for (int b = 0; b < nb; b++) {
+                int n0 = b * 6, n1 = std::min(N, n0 + 6);
+                if (n1 - n0 == 6) gemm_nm_packed_core(X, Wp, bias ? bias + n0 : nullptr, Out, N, M, K, silu, 0, M);
+                else gemm_nm_core(X, W + (size_t)n0 * K, bias ? bias + n0 : nullptr, Out + (size_t)n0 * M, n1 - n0, M, K, silu, 0, M);
+            }
+        } else {
+            gemm_nm_core(X, W, bias, Out, N, M, K, silu);
+        }
+        return;
+    }
+
+    if (Wp) {
+        // 打包路径实际采用 M 方向并行（通道方向已在 core 内向量化）
+        SimpleThreadPool::instance().parallel_for(m_blocks, [&](int mk) {
+            int ma = mk * m_chunk;
+            int mz = std::min(M, ma + m_chunk);
+            gemm_nm_packed_core(X, Wp, bias, Out, N, M, K, silu, ma, mz);
+        });
         return;
     }
 
@@ -733,6 +836,85 @@ static inline void conv3x3s1p1(const float* input, const float* weight, const fl
                 }
             }
             } // end parallel_for block
+        });
+    }
+}
+
+// 3x3 s2 p1 直接卷积（省 im2col，直接计算，AVX2 + 并行）
+static inline void conv3x3s2p1(const float* input, const float* weight, const float* bias,
+                               float* output, int N, int C_in, int H, int W, int C_out, bool silu) {
+    int outH = (H + 2 - 3) / 2 + 1;
+    int outW = (W + 2 - 3) / 2 + 1;
+    int pH = H + 2, pW = W + 2;
+    size_t pad_numel = (size_t)C_in * pH * pW;
+    float* padded = get_temp_buf(pad_numel);
+    for (int n = 0; n < N; n++) {
+        const float* in_n = input + (size_t)n * C_in * H * W;
+        float* out_n = output + (size_t)n * C_out * outH * outW;
+        // padding
+        memset(padded, 0, pad_numel * sizeof(float));
+        for (int c = 0; c < C_in; c++) {
+            const float* in_c = in_n + (size_t)c * H * W;
+            float* pad_c = padded + (size_t)c * pH * pW + pW + 1;
+            for (int h = 0; h < H; h++) memcpy(pad_c + h * pW, in_c + h * W, W * sizeof(float));
+        }
+        const int P_BLOCK = 4;
+        int num_blocks = (C_out + P_BLOCK - 1) / P_BLOCK;
+        SimpleThreadPool::instance().parallel_for(num_blocks, [&](int block_idx) {
+            int p_begin = block_idx * P_BLOCK;
+            int p_end = std::min(C_out, p_begin + P_BLOCK);
+            for (int p = p_begin; p < p_end; p++) {
+                float* out_p = out_n + (size_t)p * outH * outW;
+                float b = bias ? bias[p] : 0.0f;
+                for (int i = 0; i < outH * outW; i++) out_p[i] = b;
+                for (int q = 0; q < C_in; q++) {
+                    const float* img = padded + (size_t)q * pH * pW;
+                    const float* k = weight + ((size_t)p * C_in + q) * 9;
+                    __m256 vk0 = _mm256_set1_ps(k[0]), vk1 = _mm256_set1_ps(k[1]), vk2 = _mm256_set1_ps(k[2]);
+                    __m256 vk3 = _mm256_set1_ps(k[3]), vk4 = _mm256_set1_ps(k[4]), vk5 = _mm256_set1_ps(k[5]);
+                    __m256 vk6 = _mm256_set1_ps(k[6]), vk7 = _mm256_set1_ps(k[7]), vk8 = _mm256_set1_ps(k[8]);
+                    for (int oh = 0; oh < outH; oh++) {
+                        const float* r0 = img + (oh * 2) * pW;
+                        const float* r1 = img + (oh * 2 + 1) * pW;
+                        const float* r2 = img + (oh * 2 + 2) * pW;
+                        float* outptr = out_p + oh * outW;
+                        int ow = 0;
+                        for (; ow + 7 < outW; ow += 8) {
+                            int iw = ow * 2;
+                            __m256 s = _mm256_setzero_ps();
+                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + iw), vk0, s);
+                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + iw + 1), vk1, s);
+                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + iw + 2), vk2, s);
+                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + iw), vk3, s);
+                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + iw + 1), vk4, s);
+                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + iw + 2), vk5, s);
+                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + iw), vk6, s);
+                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + iw + 1), vk7, s);
+                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + iw + 2), vk8, s);
+                            __m256 outv = _mm256_loadu_ps(outptr + ow);
+                            outv = _mm256_add_ps(outv, s);
+                            if (silu) {
+                                __m256 t = _mm256_sub_ps(_mm256_setzero_ps(), outv);
+                                t = _mm256_min_ps(t, _mm256_set1_ps(88.0f));
+                                t = _mm256_max_ps(t, _mm256_set1_ps(-88.0f));
+                                t = _mm256_fmadd_ps(t, _mm256_set1_ps(12102203.0f), _mm256_set1_ps(1064866805.0f));
+                                __m256 ex = _mm256_castsi256_ps(_mm256_cvttps_epi32(t));
+                                outv = _mm256_div_ps(outv, _mm256_add_ps(_mm256_set1_ps(1.0f), ex));
+                            }
+                            _mm256_storeu_ps(outptr + ow, outv);
+                        }
+                        for (; ow < outW; ow++) {
+                            int iw2 = ow * 2;
+                            float s = r0[iw2]*k[0] + r0[iw2+1]*k[1] + r0[iw2+2]*k[2]
+                                    + r1[iw2]*k[3] + r1[iw2+1]*k[4] + r1[iw2+2]*k[5]
+                                    + r2[iw2]*k[6] + r2[iw2+1]*k[7] + r2[iw2+2]*k[8];
+                            float v = outptr[ow] + s;
+                            if (silu) v = v / (1.0f + fast_exp(-v));
+                            outptr[ow] = v;
+                        }
+                    }
+                }
+            }
         });
     }
 }
@@ -1141,8 +1323,13 @@ static inline void op_conv(const Tensor& input, const Tensor& weight, const Tens
                 gemm_nm(in_n, weight.data, bias ? bias->data : nullptr,
                         out_n, C_out, M, C_in, apply_silu);
             }
+        } else if (false && kH == 3 && kW == 3 && attr.stride_h == 2 && attr.stride_w == 2
+                   && attr.pad_h == 1 && attr.pad_w == 1 && attr.dilation_h == 1 && attr.dilation_w == 1) {
+            conv3x3s2p1(input.data, weight.data, bias ? bias->data : nullptr,
+                        output.data, N, C_in, H, W, C_out, apply_silu);
+            return;
         } else {
-            // 普通卷积（如 3x3 s2）：im2col 成 [K, M] 布局 + gemm_nm
+            // 普通卷积：im2col 成 [K, M] 布局 + gemm_nm
             size_t col_numel = (size_t)N * M * col_size;
             float* col = get_temp_buf(col_numel);
             im2col_km(input.data, col, N, C_in, H, W, kH, kW,
@@ -2116,7 +2303,7 @@ static inline void op_softmax(const Tensor& input, Tensor& output, int axis) {
 
     // 快速路径：inner==1（reduce最后一维），连续内存访问
     if (inner == 1) {
-        const bool vok = false && axis_size >= 16;
+        const bool vok = axis_size >= 16;
         const __m256 vones = _mm256_set1_ps(1.0f);
         for (int o = 0; o < outer; o++) {
             const float* src = input.data + (size_t)o * axis_size;
