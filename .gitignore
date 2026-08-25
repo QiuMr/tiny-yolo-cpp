@@ -12,19 +12,20 @@ x64/
 Debug/
 Release/
 out/
+*.exe
 
-# DLLs (按需保留发布版，其余忽略)
-# tiny_yolo.dll
-# tiny_yolo_x86.dll
+# DLLs: ??????????
+*.dll
+!tiny_yolo.dll
+!tiny_yolo_x86.dll
 
-# Models - 建议用 Git LFS 或 Release 附件托管
+# Models - ????? Release ??? Git LFS
 *.onnx
 *.tyro
 *.bin
 
-# Test artifacts
+# Test artifacts / scratch
 test_*.exe
-*_x64.exe
 *.log
 mat_*.txt
 prof*.txt
@@ -32,6 +33,22 @@ output*.txt
 result.jpg
 dbg_*.bin
 engine_output.bin
+f_*.txt
+fast_exp_*.txt
+crash_test.txt
+final_verify.txt
+compile_errors.txt
+analyze_*.py
+check_*.py
+debug_*.py
+1.jpg
+black.jpg
+test.jpg
+
+# Vendored / local-only
+ncnn-master/
+include/
+test_clean/
 
 # Temp / IDE
 .vs/
@@ -54,4 +71,5 @@ Desktop.ini
 backup_*/
 tiny_yolo_ref/
 tiny_yolo_backup.dll
+tiny_yolo_baseline.dll
 *.tmp
