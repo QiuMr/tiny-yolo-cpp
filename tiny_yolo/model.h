@@ -49,6 +49,7 @@ public:
         ops.clear();
         loaded = false;
         clear_winograd_weight_cache(); // 权重内存即将释放，清理 Winograd 权重缓存
+        clear_packed_W_cache();        // 同理清理 1x1 打包权重缓存（防止地址复用导致脏数据）
         SimpleThreadPool::instance().shutdown();
     }
 
@@ -486,6 +487,8 @@ public:
 
         // 性能分析仅在设置 TINY_YOLO_PROFILE 环境变量时开启（避免每帧开销）
         static const bool prof_enabled = (getenv("TINY_YOLO_PROFILE") != nullptr);
+        // NaN/Inf 追踪：TINY_YOLO_NAN_DEBUG=1 时逐算子检查输出，定位数值爆炸源头
+        static const bool nan_debug = (getenv("TINY_YOLO_NAN_DEBUG") != nullptr);
         double op_time[256] = {0};
         int op_count[256] = {0};
 
@@ -507,6 +510,54 @@ public:
                 double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
                 op_time[op.op_type] += ms;
                 op_count[op.op_type]++;
+            }
+            if (nan_debug && op.output_ids.size() > 0) {
+                uint16_t oid = op.output_ids[0];
+                Tensor& t = tensors[oid];
+                if (t.dtype == 0 && t.data) {
+                    size_t nan_cnt = 0, inf_cnt = 0;
+                    float mn = 1e30f, mx = -1e30f;
+                    for (int k = 0; k < t.numel; k++) {
+                        float v = t.data[k];
+                        if (_isnan(v)) { nan_cnt++; continue; }
+                        if (!_finite(v)) { inf_cnt++; continue; }
+                        if (v < mn) mn = v;
+                        if (v > mx) mx = v;
+                    }
+                    if (nan_cnt || inf_cnt) {
+                        printf("[NaN] op %zu type=%d -> tensor %u ndim=%d shape=[", i, op.op_type, oid, t.ndim);
+                        for (int d = 0; d < t.ndim; d++) printf("%d,", t.shape[d]);
+                        printf("] nan=%zu inf=%zu finite_range=[%g,%g]\n", nan_cnt, inf_cnt, mn, mx);
+                        // 打印前 8 个 NaN 的线性索引及 4D 解码位置
+                        int shown = 0;
+                        for (int k = 0; k < t.numel && shown < 8; k++) {
+                            if (!_isnan(t.data[k])) continue;
+                            printf("    nan_idx[%d] flat=%d", shown, k);
+                            if (t.ndim == 4) {
+                                int HW = t.shape[2] * t.shape[3];
+                                int c = k / HW, rem = k % HW;
+                                printf(" -> n0 c%d h%d w%d", c, rem / t.shape[3], rem % t.shape[3]);
+                            }
+                            printf(" val=%g\n", t.data[k]);
+                            shown++;
+                        }
+                        printf("  input shapes:\n");
+                        for (size_t k = 0; k < op.input_ids.size(); k++) {
+                            Tensor& in_t = tensors[op.input_ids[k]];
+                            printf("    in[%zu] t%u ndim=%d dtype=%d shape=[", k, op.input_ids[k], in_t.ndim, in_t.dtype);
+                            for (int d = 0; d < in_t.ndim; d++) printf("%d,", in_t.shape[d]);
+                            printf("]");
+                            // 顺带检查输入是否已含 NaN
+                            if (in_t.dtype == 0 && in_t.data) {
+                                size_t in_nan = 0;
+                                for (int q = 0; q < in_t.numel; q++) if (_isnan(in_t.data[q])) in_nan++;
+                                if (in_nan) printf(" ALREADY_NAN=%zu", in_nan);
+                            }
+                            printf("\n");
+                        }
+                        return false; // 找到第一个源头即停，避免刷屏
+                    }
+                }
             }
         }
         if (prof_enabled) {

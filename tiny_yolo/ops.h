@@ -1,5 +1,5 @@
-﻿// Tiny YOLO - 算子实现
-// 全部 inline，减小体积
+// Tiny YOLO - ����ʵ��
+// ȫ�� inline����С���?
 #pragma once
 #include "tensor.h"
 #include "model_format.h"
@@ -22,13 +22,13 @@
 #include <windows.h>
 #endif
 
-// 前向声明（定义在下方"激活函数"章节）
+// ǰ���������������·�"�����"�½ڣ�
 static inline float fast_exp(float x);
 
 // ============================================================
-// 简单线程池（模型加载时创建，推理时复用，避免线程创建/销毁开销）
-// 任务发布：原子代数（release/acquire）；唤醒：每 worker 一个自动重置事件
-// （即时唤醒、无定时器分辨率陷阱、空闲零 CPU 占用）
+// ���̳߳أ�ģ�ͼ���ʱ����������ʱ���ã������̴߳���/���ٿ�����
+// ���񷢲���ԭ�Ӵ�����release/acquire�������ѣ�ÿ worker һ���Զ������¼�
+// ����ʱ���ѡ��޶�ʱ���ֱ������塢������ CPU ռ�ã�
 // ============================================================
 class SimpleThreadPool {
 public:
@@ -41,13 +41,14 @@ public:
         if (workers.size() > 0) return;
         stop_flag.store(false, std::memory_order_relaxed);
         for (int i = 0; i < num_threads; i++) {
-            HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr); // 自动重置
+            HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr); // �Զ�����
             wake_events.push_back(ev);
             workers.emplace_back([this, ev, i] { worker_loop(ev); });
         }
     }
 
     void shutdown() {
+        if (workers.empty()) return;
         stop_flag.store(true, std::memory_order_release);
         generation.fetch_add(1, std::memory_order_release);
         for (HANDLE h : wake_events) SetEvent(h);
@@ -57,9 +58,37 @@ public:
         workers.clear();
         for (HANDLE h : wake_events) CloseHandle(h);
         wake_events.clear();
+        stop_flag.store(false, std::memory_order_relaxed);
+        generation.store(0, std::memory_order_relaxed);
+        current_func = nullptr;
     }
 
-    // 并行执行 [0, count) 范围的任务，每个任务调用 func(i)
+    // �����˳�ʱ���ã�ֻ���źŲ� detach�������� DllMain
+    void shutdown_detach() {
+        if (workers.empty()) return;
+        stop_flag.store(true, std::memory_order_release);
+        generation.fetch_add(1, std::memory_order_release);
+        for (HANDLE h : wake_events) SetEvent(h);
+        for (auto& w : workers) {
+            if (w.joinable()) w.detach();
+        }
+        workers.clear();
+        for (HANDLE h : wake_events) CloseHandle(h);
+        wake_events.clear();
+    }
+
+    ~SimpleThreadPool() {
+        if (!workers.empty()) {
+            // ��̬��������ʱ���� join�������� loader lock �ڣ���ֱ�� detach ���� std::terminate
+            stop_flag.store(true, std::memory_order_release);
+            generation.fetch_add(1, std::memory_order_release);
+            for (HANDLE h : wake_events) SetEvent(h);
+            for (auto& w : workers) if (w.joinable()) w.detach();
+            for (HANDLE h : wake_events) CloseHandle(h);
+        }
+    }
+
+    // ����ִ�� [0, count) ��Χ������ÿ���������?func(i)
     void parallel_for(int count, std::function<void(int)> func) {
         int nw = (int)workers.size();
         if (nw == 0 || count <= 1) {
@@ -71,15 +100,15 @@ public:
         next_idx.store(0, std::memory_order_relaxed);
         total_count = count;
         done_count.store(0, std::memory_order_relaxed);
-        generation.fetch_add(1, std::memory_order_release); // 发布新任务
+        generation.fetch_add(1, std::memory_order_release); // ����������
         for (HANDLE h : wake_events) SetEvent(h);
 
-        // 主线程也参与工作
+        // ���߳�Ҳ���빤��
         int idx;
         while ((idx = next_idx.fetch_add(1, std::memory_order_relaxed)) < count)
             func(idx);
 
-        // 等待全部完成（workers 已被事件唤醒并工作，短暂自旋即可）
+        // �ȴ�ȫ����ɣ�workers �ѱ��¼����Ѳ������������������ɣ�
         uint32_t spins = 0;
         while (done_count.load(std::memory_order_acquire) < nw) {
             if (++spins % 256 == 0) SwitchToThread();
@@ -95,14 +124,14 @@ private:
           done_count(0), generation(0), current_func(nullptr) {}
 
     void worker_loop(HANDLE wake_ev) {
-        // 基线取"上一代"：即使本线程启动晚于首次任务发布，也不会漏掉任何一代
+        // ����ȡ"��һ��"����ʹ���߳����������״����񷢲���Ҳ����©���κ�һ��
         uint64_t my_gen = generation.load(std::memory_order_acquire) - 1;
         while (true) {
             bool has_new = (generation.load(std::memory_order_acquire) != my_gen)
                            && current_func != nullptr;
             if (!has_new) {
                 if (stop_flag.load(std::memory_order_acquire)) return;
-                // 空闲：阻塞等待唤醒（自动重置事件，零 CPU）
+                // ���У������ȴ����ѣ��Զ������¼����� CPU��
                 WaitForSingleObject(wake_ev, INFINITE);
                 continue;
             }
@@ -122,21 +151,21 @@ private:
     std::vector<HANDLE> wake_events;
     std::atomic<bool> stop_flag;
     std::atomic<int> next_idx;
-    int total_count;                      // 仅主线程写，worker 只读
+    int total_count;                      // �����߳�д��worker ֻ��
     std::atomic<int> done_count;
     std::atomic<uint64_t> generation;
-    std::function<void(int)>* current_func; // 主线程写、发布后 worker 只读
+    std::function<void(int)>* current_func; // ���߳�д�������� worker ֻ��
 };
 
 // ============================================================
-// 工具函数
+// ���ߺ���
 // ============================================================
 
-// 简单的 GEMM: C = A * B + bias
-// A: [M, K], B: [K, N], C: [M, N], bias: [M] 或 nullptr
+// �򵥵� GEMM: C = A * B + bias
+// A: [M, K], B: [K, N], C: [M, N], bias: [M] �� nullptr
 static inline void gemm(const float* A, const float* B, const float* bias,
                         float* C, int M, int N, int K) {
-    // 转置 B 以提高缓存命中率
+    // ת�� B ����߻���������?
     float* Bt = (float*)malloc(K * N * sizeof(float));
     for (int i = 0; i < K; i++)
         for (int j = 0; j < N; j++)
@@ -157,8 +186,8 @@ static inline void gemm(const float* A, const float* B, const float* bias,
     free(Bt);
 }
 
-// AVX2 优化的 MatMul: C[M,N] = A[M,K] * B[K,N] + bias[N]
-// 对 M 做 4 路展开，对 N 做 8 路 AVX2 向量化（B[k*N+n] 连续）
+// AVX2 �Ż��� MatMul: C[M,N] = A[M,K] * B[K,N] + bias[N]
+// �� M �� 4 ·չ������ N �� 8 · AVX2 ��������B[k*N+n] ������
 static inline void matmul_avx(const float* A, const float* B, const float* bias,
                                 float* C, int M, int N, int K) {
     int N8 = N & ~7;
@@ -190,7 +219,7 @@ static inline void matmul_avx(const float* A, const float* B, const float* bias,
             _mm256_storeu_ps(c2 + n, s2);
             _mm256_storeu_ps(c3 + n, s3);
         }
-        // 剩余的 n（标量）
+        // ʣ���?n��������
         for (; n < N; n++) {
             float s0 = bias ? bias[n] : 0;
             float s1 = s0, s2 = s0, s3 = s0;
@@ -204,7 +233,7 @@ static inline void matmul_avx(const float* A, const float* B, const float* bias,
             c0[n] = s0; c1[n] = s1; c2[n] = s2; c3[n] = s3;
         }
     }
-    // 剩余的 m（标量）
+    // ʣ���?m��������
     for (; m < M; m++) {
         const float* a = A + (size_t)m * K;
         float* c = C + (size_t)m * N;
@@ -224,18 +253,18 @@ static inline void matmul_avx(const float* A, const float* B, const float* bias,
     }
 }
 
-// AVX2 优化的 GEMM：直接输出 [N, M] 布局
+// AVX2 �Ż��� GEMM��ֱ�����?[N, M] ����
 // C[n][m] = bias[n] + sum_k A[m][k] * W[n][k]
-// 对 K 循环做 8 路向量化，M 循环做 8 路展开（参考 ncnn 的激进展开策略）
+// �� K ѭ���� 8 ·��������M ѭ���� 8 ·չ�����ο� ncnn �ļ���չ�����ԣ�
 static inline void gemm_nc_avx(const float* A, const float* W, const float* bias,
                                  float* C, int M, int N, int K) {
-    int K8 = K & ~7;  // K 向下取整到 8 的倍数
+    int K8 = K & ~7;  // K ����ȡ���� 8 �ı���
     for (int n = 0; n < N; n++) {
         const float* w_n = W + (size_t)n * K;
         float* c_n = C + (size_t)n * M;
         float b = bias ? bias[n] : 0.0f;
 
-        // 水平求和辅助函数
+        // ˮƽ��͸�������?
         auto hsum256 = [](__m256 v) -> float {
             __m128 lo = _mm256_castps256_ps128(v);
             __m128 hi = _mm256_extractf128_ps(v, 1);
@@ -247,7 +276,7 @@ static inline void gemm_nc_avx(const float* A, const float* W, const float* bias
             return _mm_cvtss_f32(sums);
         };
 
-        // M 循环 8 路展开：w_n[k] 读一次用于 8 个 m
+        // M ѭ�� 8 ·չ����w_n[k] ��һ������ 8 �� m
         int m = 0;
         for (; m + 7 < M; m += 8) {
             const float* a0 = A + (size_t)m * K;
@@ -263,7 +292,7 @@ static inline void gemm_nc_avx(const float* A, const float* W, const float* bias
             __m256 s4=_mm256_setzero_ps(), s5=_mm256_setzero_ps();
             __m256 s6=_mm256_setzero_ps(), s7=_mm256_setzero_ps();
 
-            // K 循环 8 路向量化（FMA）
+            // K ѭ�� 8 ·��������FMA��
             for (int k = 0; k < K8; k += 8) {
                 __m256 w = _mm256_loadu_ps(w_n + k);
                 s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a0 + k), w, s0);
@@ -279,7 +308,7 @@ static inline void gemm_nc_avx(const float* A, const float* W, const float* bias
             float sum0=hsum256(s0), sum1=hsum256(s1), sum2=hsum256(s2), sum3=hsum256(s3);
             float sum4=hsum256(s4), sum5=hsum256(s5), sum6=hsum256(s6), sum7=hsum256(s7);
 
-            // 处理剩余的 K（标量）
+            // ����ʣ���?K��������
             for (int k = K8; k < K; k++) {
                 float w = w_n[k];
                 sum0 += a0[k]*w; sum1 += a1[k]*w; sum2 += a2[k]*w; sum3 += a3[k]*w;
@@ -290,7 +319,7 @@ static inline void gemm_nc_avx(const float* A, const float* W, const float* bias
             c_n[m+4]=sum4+b; c_n[m+5]=sum5+b; c_n[m+6]=sum6+b; c_n[m+7]=sum7+b;
         }
 
-        // 4 路展开处理剩余
+        // 4 ·չ������ʣ��
         for (; m + 3 < M; m += 4) {
             const float* a0 = A + (size_t)m * K;
             const float* a1 = A + (size_t)(m+1) * K;
@@ -313,7 +342,7 @@ static inline void gemm_nc_avx(const float* A, const float* W, const float* bias
             c_n[m]=sum0+b; c_n[m+1]=sum1+b; c_n[m+2]=sum2+b; c_n[m+3]=sum3+b;
         }
 
-        // 处理剩余的 M（标量版本）
+        // ����ʣ���?M�������汾��
         for (; m < M; m++) {
             const float* a_m = A + (size_t)m * K;
             float s = b;
@@ -323,17 +352,17 @@ static inline void gemm_nc_avx(const float* A, const float* W, const float* bias
     }
 }
 
-// SSE2 优化的 GEMM：直接输出 [N, M] 布局
+// SSE2 �Ż��� GEMM��ֱ�����?[N, M] ����
 // C[n][m] = bias[n] + sum_k A[m][k] * W[n][k]
-// 对 K 循环做 4 路向量化，M 循环做 4 路展开
+// �� K ѭ���� 4 ·��������M ѭ���� 4 ·չ��
 static inline void gemm_nc_sse(const float* A, const float* W, const float* bias,
                                  float* C, int M, int N, int K) {
-    int K4 = K & ~3;  // K 向下取整到 4 的倍数
+    int K4 = K & ~3;  // K ����ȡ���� 4 �ı���
     for (int n = 0; n < N; n++) {
         const float* w_n = W + (size_t)n * K;
         float* c_n = C + (size_t)n * M;
 
-        // M 循环 4 路展开
+        // M ѭ�� 4 ·չ��
         int m = 0;
         for (; m + 3 < M; m += 4) {
             const float* a0 = A + (size_t)m * K;
@@ -343,7 +372,7 @@ static inline void gemm_nc_sse(const float* A, const float* W, const float* bias
             __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps();
             __m128 s2 = _mm_setzero_ps(), s3 = _mm_setzero_ps();
 
-            // K 循环 4 路向量化（FMA）
+            // K ѭ�� 4 ·��������FMA��
             for (int k = 0; k < K4; k += 4) {
                 __m128 w = _mm_loadu_ps(w_n + k);
                 s0 = _mm_fmadd_ps(_mm_loadu_ps(a0 + k), w, s0);
@@ -352,7 +381,7 @@ static inline void gemm_nc_sse(const float* A, const float* W, const float* bias
                 s3 = _mm_fmadd_ps(_mm_loadu_ps(a3 + k), w, s3);
             }
 
-            // 水平求和
+            // ˮƽ���?
             auto hsum = [](__m128 v) -> float {
                 __m128 shuf = _mm_shuffle_ps(v, v, _MM_SHUFFLE(2,3,0,1));
                 __m128 sums = _mm_add_ps(v, shuf);
@@ -363,7 +392,7 @@ static inline void gemm_nc_sse(const float* A, const float* W, const float* bias
 
             float sum0 = hsum(s0), sum1 = hsum(s1), sum2 = hsum(s2), sum3 = hsum(s3);
 
-            // 处理剩余的 K（标量）
+            // ����ʣ���?K��������
             float b = bias ? bias[n] : 0.0f;
             for (int k = K4; k < K; k++) {
                 float w = w_n[k];
@@ -379,7 +408,7 @@ static inline void gemm_nc_sse(const float* A, const float* W, const float* bias
             c_n[m+3] = sum3 + b;
         }
 
-        // 处理剩余的 M（标量版本）
+        // ����ʣ���?M�������汾��
         float b = bias ? bias[n] : 0.0f;
         for (; m < M; m++) {
             const float* a_m = A + (size_t)m * K;
@@ -395,12 +424,12 @@ static inline void gemm_nc_sse(const float* A, const float* W, const float* bias
 // A: [M, K], W: [N, K], C: [N, M], bias: [N] or nullptr
 static inline void gemm_nc(const float* A, const float* W, const float* bias,
                             float* C, int M, int N, int K) {
-    // K >= 32 且 M >= 4 时使用 AVX2 版本
+    // K >= 32 �� M >= 4 ʱʹ�� AVX2 �汾
     if (K >= 32 && M >= 4) {
         gemm_nc_avx(A, W, bias, C, M, N, K);
         return;
     }
-    // K >= 16 且 M >= 4 时使用 SSE 版本
+    // K >= 16 �� M >= 4 ʱʹ�� SSE �汾
     if (K >= 16 && M >= 4) {
         gemm_nc_sse(A, W, bias, C, M, N, K);
         return;
@@ -411,7 +440,7 @@ static inline void gemm_nc(const float* A, const float* W, const float* bias,
         float* c_n = C + (size_t)n * M;
         float b = bias ? bias[n] : 0.0f;
 
-        // M 循环 8 路展开：w_n[k] 读一次用于 8 个 m
+        // M ѭ�� 8 ·չ����w_n[k] ��һ������ 8 �� m
         int m = 0;
         for (; m + 7 < M; m += 8) {
             const float* a0 = A + (size_t)m * K;
@@ -437,7 +466,7 @@ static inline void gemm_nc(const float* A, const float* W, const float* bias,
             c_n[m]=s0; c_n[m+1]=s1; c_n[m+2]=s2; c_n[m+3]=s3;
             c_n[m+4]=s4; c_n[m+5]=s5; c_n[m+6]=s6; c_n[m+7]=s7;
         }
-        // 4 路展开处理剩余
+        // 4 ·չ������ʣ��
         for (; m + 3 < M; m += 4) {
             const float* a0 = A + (size_t)m * K;
             const float* a1 = A + (size_t)(m+1) * K;
@@ -453,7 +482,7 @@ static inline void gemm_nc(const float* A, const float* W, const float* bias,
             }
             c_n[m] = s0; c_n[m+1] = s1; c_n[m+2] = s2; c_n[m+3] = s3;
         }
-        // 处理剩余的 m
+        // ����ʣ���?m
         for (; m < M; m++) {
             const float* a_m = A + (size_t)m * K;
             float s = b;
@@ -464,10 +493,10 @@ static inline void gemm_nc(const float* A, const float* W, const float* bias,
 }
 
 // ============================================================
-// 并行 GEMM：Out[N, M] = W[N, K] * X[K, M] + bias[N]
-// X 行主序 [K][M]，W 行主序 [N][K]，Out 行主序 [N][M]
-// 输入直接是卷积特征图的内存布局，无需任何转置
-// 对输出通道分块（NB=6）并行，m 方向 AVX2+FMA 8 路向量化
+// ���� GEMM��Out[N, M] = W[N, K] * X[K, M] + bias[N]
+// X ������ [K][M]��W ������ [N][K]��Out ������ [N][M]
+// ����ֱ���Ǿ�������ͼ���ڴ沼�֣������κ�ת��
+// �����ͨ���ֿ飨NB=6�����У�m ���� AVX2+FMA 8 ·������
 // ============================================================
 static inline void gemm_nm_core(const float* X, const float* W, const float* bias,
                                  float* Out, int N, int M, int K, bool silu,
@@ -502,10 +531,11 @@ static inline void gemm_nm_core(const float* X, const float* W, const float* bia
                            (i == 3) ? acc3 : (i == 4) ? acc4 : acc5;
                 if (bias) v = _mm256_add_ps(v, _mm256_set1_ps(bias[n0 + i]));
                 if (silu) {
-                    // 向量化 fast_exp（Schraudolph），带 ±88 钳制与标量版语义一致
+                    // 向量化 fast_exp（Schraudolph）：钳制必须远离 -87.99 毒区
+                    // （x < -87.9895 时整数结果变负，reinterpret 成 float 即 NaN）
                     __m256 t = _mm256_sub_ps(_mm256_setzero_ps(), v);
-                    t = _mm256_min_ps(t, _mm256_set1_ps(88.0f));
-                    t = _mm256_max_ps(t, _mm256_set1_ps(-88.0f));
+                    t = _mm256_min_ps(t, _mm256_set1_ps(86.0f));
+                    t = _mm256_max_ps(t, _mm256_set1_ps(-86.0f));
                     t = _mm256_fmadd_ps(t, _mm256_set1_ps(12102203.0f), _mm256_set1_ps(1064866805.0f));
                     __m256 ex = _mm256_castsi256_ps(_mm256_cvttps_epi32(t));
                     v = _mm256_div_ps(v, _mm256_add_ps(vones, ex));
@@ -513,7 +543,7 @@ static inline void gemm_nm_core(const float* X, const float* W, const float* bia
                 _mm256_storeu_ps(o0 + (size_t)i * M + m, v);
             }
         }
-        // m 尾部（标量）
+        // m β����������
         for (; m < m1; m++) {
             float s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0;
             for (int k = 0; k < K; k++) {
@@ -535,20 +565,20 @@ static inline void gemm_nm_core(const float* X, const float* W, const float* bia
     }
 }
 
-// W 打包缓存：把 W[N,K] 预排为 [K][N/6][6] 连续块，FMA 时 6 个通道值连续命中同一缓存行
+// W ������棺��?W[N,K] Ԥ��Ϊ [K][N/6][6] �����飬FMA ʱ 6 ��ͨ��ֵ��������ͬһ������
 struct PackedW { std::vector<float> data; int N = 0, K = 0; };
 static std::unordered_map<const void*, PackedW> g_packedW;
 static std::mutex g_packedW_mtx;
 
 static inline const float* get_packed_W(const float* W, int N, int K) {
-    if (N % 6 != 0 || K < 32) return nullptr; // 仅对大 K 且 N 为 6 倍数的 1x1 卷积打包
+    if (N % 6 != 0 || K < 32) return nullptr; // ���Դ� K �� N Ϊ 6 ������ 1x1 �������?
     std::lock_guard<std::mutex> lk(g_packedW_mtx);
     auto it = g_packedW.find(W);
     if (it != g_packedW.end() && it->second.N == N && it->second.K == K) return it->second.data.data();
+    // ��Ȩ�ػ���״�仯����ģ�����غ��ַ���ã��������ؽ������Ǿ����?
     PackedW pw; pw.N = N; pw.K = K;
     pw.data.resize((size_t)K * N);
-    // 布局: pw[k*N + n] -> 原 W[n*K + k] 按 k 外层、n 连续重排为 6 通道块内连续
-    // 实际按 [K][nb][6]：k*Nb*6 + nb*6 + i
+    // ����: [K][nb][6]��k*Nb*6 + nb*6 + i
     int nb = N / 6;
     for (int k = 0; k < K; k++) {
         for (int b = 0; b < nb; b++) {
@@ -557,14 +587,19 @@ static inline const float* get_packed_W(const float* W, int N, int K) {
             }
         }
     }
-    auto res = g_packedW.emplace(W, std::move(pw));
-    return res.first->second.data.data();
+    g_packedW[W] = std::move(pw);
+    return g_packedW[W].data.data();
+}
+
+static inline void clear_packed_W_cache() {
+    std::lock_guard<std::mutex> lk(g_packedW_mtx);
+    g_packedW.clear();
 }
 
 static inline void gemm_nm_packed_core(const float* X, const float* Wp, const float* bias,
                                         float* Out, int N, int M, int K, bool silu,
                                         int m0, int m1) {
-    // Wp 已打包为 [K][N] 转置连续：Wp[k*N + n]
+    // Wp �Ѵ���?[K][N] ת��������Wp[k*N + n]
     int nb = N / 6;
     for (int b = 0; b < nb; b++) {
         float* o0 = Out + (size_t)(b * 6) * M;
@@ -577,7 +612,7 @@ static inline void gemm_nm_packed_core(const float* X, const float* Wp, const fl
             const float* wpk = Wp + b * 6;
             for (int k = 0; k < K; k++, xk += M, wpk += N) {
                 __m256 xv = _mm256_loadu_ps(xk);
-                // 6 个通道值连续，广播各自通道
+                // 6 ��ͨ��ֵ�������㲥����ͨ��
                 acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(wpk + 0), xv, acc0);
                 acc1 = _mm256_fmadd_ps(_mm256_broadcast_ss(wpk + 1), xv, acc1);
                 acc2 = _mm256_fmadd_ps(_mm256_broadcast_ss(wpk + 2), xv, acc2);
@@ -592,8 +627,8 @@ static inline void gemm_nm_packed_core(const float* X, const float* Wp, const fl
                 if (bias) v = _mm256_add_ps(v, _mm256_set1_ps(bias[b * 6 + i]));
                 if (silu) {
                     __m256 t = _mm256_sub_ps(_mm256_setzero_ps(), v);
-                    t = _mm256_min_ps(t, _mm256_set1_ps(88.0f));
-                    t = _mm256_max_ps(t, _mm256_set1_ps(-88.0f));
+                    t = _mm256_min_ps(t, _mm256_set1_ps(86.0f));
+                    t = _mm256_max_ps(t, _mm256_set1_ps(-86.0f));
                     t = _mm256_fmadd_ps(t, _mm256_set1_ps(12102203.0f), _mm256_set1_ps(1064866805.0f));
                     __m256 ex = _mm256_castsi256_ps(_mm256_cvttps_epi32(t));
                     v = _mm256_div_ps(v, _mm256_add_ps(vones, ex));
@@ -626,7 +661,7 @@ static inline void gemm_nm(const float* X, const float* W, const float* bias,
         return;
     }
 
-    // 尝试 W 打包路径（大 K 且 N 为 6 倍数时命中）
+    // ���� W ���·������?K �� N Ϊ 6 ����ʱ���У�
     const float* Wp = nullptr;
     if (N % 6 == 0 && K >= 32) Wp = get_packed_W(W, N, K);
 
@@ -635,7 +670,7 @@ static inline void gemm_nm(const float* X, const float* W, const float* bias,
     if (!Wp && xbytes <= (2u << 20)) {
         while (CH > 1 && (N + CH - 1) / CH < workers * 2) CH--;
     } else if (Wp) {
-        CH = 6; // 打包路径固定 6 通道块
+        CH = 6; // ���·���̶�?6 ͨ����
     }
     int nb = (N + CH - 1) / CH;
     int mb = 1;
@@ -645,7 +680,7 @@ static inline void gemm_nm(const float* X, const float* W, const float* bias,
     int tasks = nb * m_blocks;
     if (tasks <= 1) {
         if (Wp) {
-            // 打包路径需按 6 通道块切分时单独处理
+            // ���·����?6 ͨ�����з�ʱ��������
             for (int b = 0; b < nb; b++) {
                 int n0 = b * 6, n1 = std::min(N, n0 + 6);
                 if (n1 - n0 == 6) gemm_nm_packed_core(X, Wp, bias ? bias + n0 : nullptr, Out, N, M, K, silu, 0, M);
@@ -658,7 +693,7 @@ static inline void gemm_nm(const float* X, const float* W, const float* bias,
     }
 
     if (Wp) {
-        // 打包路径实际采用 M 方向并行（通道方向已在 core 内向量化）
+        // ���·��ʵ�ʲ���?M �����У�ͨ���������� core ����������
         SimpleThreadPool::instance().parallel_for(m_blocks, [&](int mk) {
             int ma = mk * m_chunk;
             int mz = std::min(M, ma + m_chunk);
@@ -679,7 +714,7 @@ static inline void gemm_nm(const float* X, const float* W, const float* bias,
     });
 }
 
-// 线程局部临时缓冲区（用于 col 等中间计算，避免频繁 malloc/free，多线程安全）
+// �ֲ߳̾���ʱ������������ col ���м���㣬����Ƶ��?malloc/free�����̰߳�ȫ��
 static inline float* get_temp_buf(size_t numel) {
     struct Holder {
         float* p = nullptr;
@@ -696,8 +731,8 @@ static inline float* get_temp_buf(size_t numel) {
     return buf.p;
 }
 
-// 3x3 s1 p1 专用卷积 v2（参考 ncnn：同时处理两行输出，中间行共享）
-// AVX2 优化：每行一次处理 8 个像素
+// 3x3 s1 p1 ר�þ��� v2���ο� ncnn��ͬʱ��������������м��й�����?
+// AVX2 �Ż���ÿ��һ�δ��� 8 ������
 static inline void conv3x3s1p1(const float* input, const float* weight, const float* bias,
                                  float* output, int N, int C_in, int H, int W, int C_out) {
     int outH = H, outW = W;
@@ -720,7 +755,7 @@ static inline void conv3x3s1p1(const float* input, const float* weight, const fl
             }
         }
 
-        // 2. 对每个输出通道（多线程：按输出通道块并行）
+        // 2. ��ÿ�����ͨ�������̣߳������ͨ���鲢�У�
         const int P_BLOCK = 4;
         int num_blocks = (C_out + P_BLOCK - 1) / P_BLOCK;
         SimpleThreadPool::instance().parallel_for(num_blocks, [&](int block_idx) {
@@ -731,7 +766,7 @@ static inline void conv3x3s1p1(const float* input, const float* weight, const fl
             float b = bias ? bias[p] : 0.0f;
             for (int i = 0; i < outH * outW; i++) out_p[i] = b;
 
-        // 3. 对每个输入通道累加
+        // 3. ��ÿ������ͨ���ۼ�
             for (int q = 0; q < C_in; q++) {
                 const float* img = padded + (size_t)q * pH * pW;
                 const float* k = weight + ((size_t)p * C_in + q) * 9;
@@ -739,7 +774,7 @@ static inline void conv3x3s1p1(const float* input, const float* weight, const fl
                 const float* k1 = k + 3;
                 const float* k2 = k + 6;
 
-                // 预加载权重到 AVX2 寄存器
+                // Ԥ����Ȩ�ص� AVX2 �Ĵ���
                 __m256 vk00 = _mm256_set1_ps(k0[0]);
                 __m256 vk01 = _mm256_set1_ps(k0[1]);
                 __m256 vk02 = _mm256_set1_ps(k0[2]);
@@ -757,14 +792,14 @@ static inline void conv3x3s1p1(const float* input, const float* weight, const fl
                 const float* r3 = img + pW * 3;
 
                 int h = 0;
-                // 同时处理两行输出
+                // ͬʱ�����������?
                 for (; h + 1 < outH; h += 2) {
                     float* outptr2 = outptr + outW;
 
                     int w = 0;
-                    // AVX2+FMA：每行一次处理 8 个像素
+                    // AVX2+FMA��ÿ��һ�δ��� 8 ������
                     for (; w + 7 < outW; w += 8) {
-                        // 第一行输出：r0, r1, r2
+                        // ��һ�������r0, r1, r2
                         __m256 sum1 = _mm256_setzero_ps();
                         sum1 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + w), vk00, sum1);
                         sum1 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + w + 1), vk01, sum1);
@@ -777,7 +812,7 @@ static inline void conv3x3s1p1(const float* input, const float* weight, const fl
                         sum1 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + w + 2), vk22, sum1);
                         _mm256_storeu_ps(outptr + w, _mm256_add_ps(_mm256_loadu_ps(outptr + w), sum1));
 
-                        // 第二行输出：r1, r2, r3（r1, r2 与第一行共享）
+                        // �ڶ��������r1, r2, r3��r1, r2 ���һ�й�����?
                         __m256 sum2 = _mm256_setzero_ps();
                         sum2 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + w), vk00, sum2);
                         sum2 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + w + 1), vk01, sum2);
@@ -790,7 +825,7 @@ static inline void conv3x3s1p1(const float* input, const float* weight, const fl
                         sum2 = _mm256_fmadd_ps(_mm256_loadu_ps(r3 + w + 2), vk22, sum2);
                         _mm256_storeu_ps(outptr2 + w, _mm256_add_ps(_mm256_loadu_ps(outptr2 + w), sum2));
                     }
-                    // 剩余像素（标量）
+                    // ʣ�����أ�������
                     for (; w < outW; w++) {
                         float s1 = r0[w]*k0[0] + r0[w+1]*k0[1] + r0[w+2]*k0[2]
                                  + r1[w]*k1[0] + r1[w+1]*k1[1] + r1[w+2]*k1[2]
@@ -802,14 +837,14 @@ static inline void conv3x3s1p1(const float* input, const float* weight, const fl
                         outptr2[w] += s2;
                     }
 
-                    // 跳到下一对行
+                    // ������һ����
                     r0 += 2 * pW;
                     r1 += 2 * pW;
                     r2 += 2 * pW;
                     r3 += 2 * pW;
                     outptr += 2 * outW;
                 }
-                // 处理剩余的单行
+                // ����ʣ��ĵ���?
                 for (; h < outH; h++) {
                     int w = 0;
                     for (; w + 7 < outW; w += 8) {
@@ -840,7 +875,7 @@ static inline void conv3x3s1p1(const float* input, const float* weight, const fl
     }
 }
 
-// 3x3 s2 p1 直接卷积（省 im2col，直接计算，AVX2 + 并行）
+// 3x3 s2 p1 ֱ�Ӿ�����ʡ im2col��ֱ�Ӽ��㣬AVX2 + ���У�
 static inline void conv3x3s2p1(const float* input, const float* weight, const float* bias,
                                float* output, int N, int C_in, int H, int W, int C_out, bool silu) {
     int outH = (H + 2 - 3) / 2 + 1;
@@ -870,48 +905,76 @@ static inline void conv3x3s2p1(const float* input, const float* weight, const fl
                 for (int q = 0; q < C_in; q++) {
                     const float* img = padded + (size_t)q * pH * pW;
                     const float* k = weight + ((size_t)p * C_in + q) * 9;
-                    __m256 vk0 = _mm256_set1_ps(k[0]), vk1 = _mm256_set1_ps(k[1]), vk2 = _mm256_set1_ps(k[2]);
-                    __m256 vk3 = _mm256_set1_ps(k[3]), vk4 = _mm256_set1_ps(k[4]), vk5 = _mm256_set1_ps(k[5]);
-                    __m256 vk6 = _mm256_set1_ps(k[6]), vk7 = _mm256_set1_ps(k[7]), vk8 = _mm256_set1_ps(k[8]);
                     for (int oh = 0; oh < outH; oh++) {
                         const float* r0 = img + (oh * 2) * pW;
                         const float* r1 = img + (oh * 2 + 1) * pW;
                         const float* r2 = img + (oh * 2 + 2) * pW;
                         float* outptr = out_p + oh * outW;
                         int ow = 0;
-                        for (; ow + 7 < outW; ow += 8) {
+                        // stride=2 ʱ��������Ĳ��������?2�����ܰ� s1 ��ʽ���� 8 �����ء�
+                        // ��ȷ������ÿ 4 �����һ�飬���ڰ�?+0/+2/+4/+6 ƫ�Ƹ���һ��
+                        // 4 �����أ��� 3 �� lane ǡ���Ǹ������?3 ������ tap��
+                        __m128 vk01 = _mm_set_ps(0.0f, k[2], k[1], k[0]);
+                        __m128 vk34 = _mm_set_ps(0.0f, k[5], k[4], k[3]);
+                        __m128 vk67 = _mm_set_ps(0.0f, k[8], k[7], k[6]);
+                        for (; ow + 3 < outW; ow += 4) {
                             int iw = ow * 2;
-                            __m256 s = _mm256_setzero_ps();
-                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + iw), vk0, s);
-                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + iw + 1), vk1, s);
-                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + iw + 2), vk2, s);
-                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + iw), vk3, s);
-                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + iw + 1), vk4, s);
-                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + iw + 2), vk5, s);
-                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + iw), vk6, s);
-                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + iw + 1), vk7, s);
-                            s = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + iw + 2), vk8, s);
-                            __m256 outv = _mm256_loadu_ps(outptr + ow);
-                            outv = _mm256_add_ps(outv, s);
-                            if (silu) {
-                                __m256 t = _mm256_sub_ps(_mm256_setzero_ps(), outv);
-                                t = _mm256_min_ps(t, _mm256_set1_ps(88.0f));
-                                t = _mm256_max_ps(t, _mm256_set1_ps(-88.0f));
-                                t = _mm256_fmadd_ps(t, _mm256_set1_ps(12102203.0f), _mm256_set1_ps(1064866805.0f));
-                                __m256 ex = _mm256_castsi256_ps(_mm256_cvttps_epi32(t));
-                                outv = _mm256_div_ps(outv, _mm256_add_ps(_mm256_set1_ps(1.0f), ex));
-                            }
-                            _mm256_storeu_ps(outptr + ow, outv);
+                            // �� 1 ������ (k0,k1,k2)
+                            __m128 a0 = _mm_mul_ps(_mm_loadu_ps(r0 + iw), vk01);
+                            __m128 a1 = _mm_mul_ps(_mm_loadu_ps(r0 + iw + 2), vk01);
+                            __m128 a2 = _mm_mul_ps(_mm_loadu_ps(r0 + iw + 4), vk01);
+                            __m128 a3 = _mm_mul_ps(_mm_loadu_ps(r0 + iw + 6), vk01);
+                            // �� 2 ������ (k3,k4,k5)
+                            a0 = _mm_fmadd_ps(_mm_loadu_ps(r1 + iw), vk34, a0);
+                            a1 = _mm_fmadd_ps(_mm_loadu_ps(r1 + iw + 2), vk34, a1);
+                            a2 = _mm_fmadd_ps(_mm_loadu_ps(r1 + iw + 4), vk34, a2);
+                            a3 = _mm_fmadd_ps(_mm_loadu_ps(r1 + iw + 6), vk34, a3);
+                            // �� 3 ������ (k6,k7,k8)
+                            a0 = _mm_fmadd_ps(_mm_loadu_ps(r2 + iw), vk67, a0);
+                            a1 = _mm_fmadd_ps(_mm_loadu_ps(r2 + iw + 2), vk67, a1);
+                            a2 = _mm_fmadd_ps(_mm_loadu_ps(r2 + iw + 4), vk67, a2);
+                            a3 = _mm_fmadd_ps(_mm_loadu_ps(r2 + iw + 6), vk67, a3);
+                            // ˮƽ��ͣ�lane3 ��Ϊ 0��v0+v1+v2 �����?
+                            __m128 t0 = _mm_add_ps(a0, _mm_movehl_ps(a0, a0));
+                            __m128 t1 = _mm_add_ps(a1, _mm_movehl_ps(a1, a1));
+                            __m128 t2 = _mm_add_ps(a2, _mm_movehl_ps(a2, a2));
+                            __m128 t3 = _mm_add_ps(a3, _mm_movehl_ps(a3, a3));
+                            t0 = _mm_add_ss(t0, _mm_shuffle_ps(t0, t0, _MM_SHUFFLE(1, 1, 1, 1)));
+                            t1 = _mm_add_ss(t1, _mm_shuffle_ps(t1, t1, _MM_SHUFFLE(1, 1, 1, 1)));
+                            t2 = _mm_add_ss(t2, _mm_shuffle_ps(t2, t2, _MM_SHUFFLE(1, 1, 1, 1)));
+                            t3 = _mm_add_ss(t3, _mm_shuffle_ps(t3, t3, _MM_SHUFFLE(1, 1, 1, 1)));
+                            outptr[ow + 0] += _mm_cvtss_f32(t0);
+                            outptr[ow + 1] += _mm_cvtss_f32(t1);
+                            outptr[ow + 2] += _mm_cvtss_f32(t2);
+                            outptr[ow + 3] += _mm_cvtss_f32(t3);
                         }
                         for (; ow < outW; ow++) {
                             int iw2 = ow * 2;
-                            float s = r0[iw2]*k[0] + r0[iw2+1]*k[1] + r0[iw2+2]*k[2]
-                                    + r1[iw2]*k[3] + r1[iw2+1]*k[4] + r1[iw2+2]*k[5]
-                                    + r2[iw2]*k[6] + r2[iw2+1]*k[7] + r2[iw2+2]*k[8];
-                            float v = outptr[ow] + s;
-                            if (silu) v = v / (1.0f + fast_exp(-v));
-                            outptr[ow] = v;
+                            outptr[ow] += r0[iw2]*k[0] + r0[iw2+1]*k[1] + r0[iw2+2]*k[2]
+                                        + r1[iw2]*k[3] + r1[iw2+1]*k[4] + r1[iw2+2]*k[5]
+                                        + r2[iw2]*k[6] + r2[iw2+1]*k[7] + r2[iw2+2]*k[8];
                         }
+                    }
+                }
+                // SiLU ��������������ͨ���ۼ���ɺ�ͳһӦ��?
+                // ����ʵ���� q ѭ���ڲ���ͨ��Ӧ�ã��ȼ��ڶԲ��ֺ���������������˸�·����ǰ�����ã�
+                if (silu) {
+                    int cnt = outH * outW;
+                    int i = 0;
+                    const __m256 vones = _mm256_set1_ps(1.0f);
+                    for (; i + 7 < cnt; i += 8) {
+                        __m256 v = _mm256_loadu_ps(out_p + i);
+                        __m256 t = _mm256_sub_ps(_mm256_setzero_ps(), v);
+                    t = _mm256_min_ps(t, _mm256_set1_ps(86.0f));
+                    t = _mm256_max_ps(t, _mm256_set1_ps(-86.0f));
+                        t = _mm256_fmadd_ps(t, _mm256_set1_ps(12102203.0f), _mm256_set1_ps(1064866805.0f));
+                        __m256 ex = _mm256_castsi256_ps(_mm256_cvttps_epi32(t));
+                        v = _mm256_div_ps(v, _mm256_add_ps(vones, ex));
+                        _mm256_storeu_ps(out_p + i, v);
+                    }
+                    for (; i < cnt; i++) {
+                        float x = out_p[i];
+                        out_p[i] = x / (1.0f + fast_exp(-x));
                     }
                 }
             }
@@ -920,11 +983,15 @@ static inline void conv3x3s2p1(const float* input, const float* weight, const fl
 }
 
 // ============================================================
-// Winograd F(2,3) 卷积（3x3 s1 p1，减少 2.25x 乘法）
-// 变换后的权重缓存（权重指针 -> U），跨帧复用，避免每帧重算
+// Winograd F(2,3) ������3x3 s1 p1������ 2.25x �˷���
+// �任���Ȩ�ػ��棨Ȩ��ָ��?-> U������֡���ã�����ÿ֡����
 // ============================================================
+struct WinogradCacheEntry {
+    std::vector<float> u;
+    int kt = 0;   // �任�� tile �� k ά��С��F(2,3)=16��F(4,3)=36��������ͬȨ�صĲ�ͬ�任
+};
 struct WinogradWeightCache {
-    std::unordered_map<const void*, std::vector<float>> map;
+    std::unordered_map<const void*, WinogradCacheEntry> map;
     std::mutex mtx;
     void clear() {
         std::lock_guard<std::mutex> lock(mtx);
@@ -934,79 +1001,86 @@ struct WinogradWeightCache {
 static WinogradWeightCache g_winograd_cache;
 static inline void clear_winograd_weight_cache() { g_winograd_cache.clear(); }
 
-// 前向声明（定义在下方）
+// ǰ���������������·���
 static inline void winograd_weight_transform(const float* g, float* U);
 static inline void winograd_input_transform(const float* d, float* V);
 static inline void winograd_output_transform(const float* M, float* Y);
+static inline void wino43_weight_transform(const float* g, float* U);
+static inline void wino43_input_transform(const float* d, float* V);
+static inline void wino43_output_transform(const float* M, float* Y);
 
-// 批量GEMM版本：把Winograd转换成16个小GEMM，直接用 gemm_nm_core
-// M[k][C_out, T] = U[k][C_out, C_in] * V[k][C_in, T]，V 天然是 [K=C_in][M=T] 布局，无需转置
+// ����GEMM�汾����Winogradת����16��СGEMM��ֱ���� gemm_nm_core
+// M[k][C_out, T] = U[k][C_out, C_in] * V[k][C_in, T]��V ��Ȼ�� [K=C_in][M=T] ���֣�����ת��
 // TEMP profiling
 static double g_stage_pad = 0, g_stage_vt = 0, g_stage_gemm = 0, g_stage_ot = 0;
 static int g_stage_n = 0;
 static inline double now_ms_() {
     return (double)GetTickCount64();
 }
-static inline void conv3x3s1_winograd(const float* input, const float* weight, const float* bias,
+// ģ�����?TS = tile ����߳���? => F(2,3)��4 => F(4,3)����
+// ��֤ D/KT �Ǳ����ڳ�������ѭ��������չ��
+template<int TS>
+static inline void conv3x3s1_wino_tmpl(const float* input, const float* weight, const float* bias,
                                         float* output, bool apply_silu,
                                         int N, int C_in, int H, int W, int C_out) {
+    constexpr int D  = TS + 2;   // ���봰�ڱ߳����� kernel ���ǣ�
+    constexpr int KT = D * D;    // k �ռ��С��F(2,3)=16��F(4,3)=36��
+
     int outH = H, outW = W;
-    int pH = H + 2, pW = W + 2;
+    // padding �踲�����һ��?tile ���������ڣ������� = h_tiles*TS + 1
+    int h_tiles = (outH + TS - 1) / TS;
+    int w_tiles = (outW + TS - 1) / TS;
+    int pH = h_tiles * TS + 2, pW = w_tiles * TS + 2;
 
-    // tile数量
-    int h_tiles = (outH + 1) / 2;
-    int w_tiles = (outW + 1) / 2;
-    int num_tiles = h_tiles * w_tiles;
-    int T = num_tiles;
+    // tile����
+    int T = h_tiles * w_tiles;
 
-    // 分配 padded 输入（多分配一行，防止边界 tile 越界读）
-    // 注意：get_temp_buf 是单块线程局部缓冲（realloc 会移动指针），
-    // 必须一次性申请全部工作区，再用偏移切分出各缓冲区
+    // ���� padded ���루�����һ�У���ֹ�߽�?tile Խ�����?
+    // ע�⣺get_temp_buf �ǵ����ֲ߳̾����壨realloc ���ƶ�ָ�룩��
+    // ����һ��������ȫ��������������ƫ���зֳ���������
     size_t pad_numel = (size_t)C_in * pH * pW;
 
-    // 中间缓冲区大小
-    size_t U_size = (size_t)16 * C_out * C_in;
-    size_t V_size = (size_t)16 * C_in * T;
-    size_t M_size = (size_t)16 * C_out * T;
-    size_t total = pad_numel + pW + U_size + V_size + M_size;
+    // �м仺������С��U ֱ�����û��棬���ٿ��빤������
+    size_t V_size = (size_t)KT * C_in * T;
+    size_t M_size = (size_t)KT * C_out * T;
+    size_t total = pad_numel + pW + V_size + M_size;
     float* ws = get_temp_buf(total);
     float* padded = ws;
-    float* U = ws + pad_numel + pW;
-    float* V = U + U_size;
+    float* V = ws + pad_numel + pW;
     float* Mbuf = V + V_size;
 
-    // 1. 权重变换 U[16, C_out, C_in] = G * g * G^T（带缓存）
+    // 1. Ȩ�ر任 U[KT, C_out, C_in] = G * g * G^T�������棬����ֱ�����û���ָ�룩
+    const float* U = nullptr;
     {
-        std::vector<float>* cached = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(g_winograd_cache.mtx);
-            auto it = g_winograd_cache.map.find(weight);
-            if (it != g_winograd_cache.map.end()) {
-                cached = &it->second;
-            } else {
-                auto res = g_winograd_cache.map.emplace(weight, std::vector<float>());
-                cached = &res.first->second;
-                cached->resize(U_size);
-                for (int p = 0; p < C_out; p++) {
-                    for (int q = 0; q < C_in; q++) {
-                        const float* g = weight + ((size_t)p * C_in + q) * 9;
-                        float u[16];
-                        winograd_weight_transform(g, u);
-                        for (int k = 0; k < 16; k++) {
-                            (*cached)[((size_t)k * C_out + p) * C_in + q] = u[k];
-                        }
+        std::lock_guard<std::mutex> lock(g_winograd_cache.mtx);
+        auto it = g_winograd_cache.map.find(weight);
+        if (it != g_winograd_cache.map.end() && it->second.kt == KT) {
+            U = it->second.u.data();
+        } else {
+            WinogradCacheEntry entry;
+            entry.kt = KT;
+            entry.u.resize((size_t)KT * C_out * C_in);
+            for (int p = 0; p < C_out; p++) {
+                for (int q = 0; q < C_in; q++) {
+                    const float* g = weight + ((size_t)p * C_in + q) * 9;
+                    float u[36];
+                    if (TS == 4) wino43_weight_transform(g, u);
+                    else         winograd_weight_transform(g, u);
+                    for (int k = 0; k < KT; k++) {
+                        entry.u[((size_t)k * C_out + p) * C_in + q] = u[k];
                     }
                 }
             }
+            auto res = g_winograd_cache.map.insert_or_assign(weight, std::move(entry));
+            U = res.first->second.u.data();
         }
-        memcpy(U, cached->data(), U_size * sizeof(float));
     }
 
     for (int n = 0; n < N; n++) {
         const float* in_n = input + (size_t)n * C_in * H * W;
         float* out_n = output + (size_t)n * C_out * outH * outW;
 
-        // 2. 对输入做 padding（按输入通道并行，各通道内存区间独立）
+        // 2. �������� padding��������ͨ�����У���ͨ���ڴ����������?
         {
             SimpleThreadPool& pool_ = SimpleThreadPool::instance();
             bool pmt = (pool_.num_threads() > 1 && pad_numel >= 32768);
@@ -1014,7 +1088,7 @@ static inline void conv3x3s1_winograd(const float* input, const float* weight, c
                 const float* in_c = in_n + (size_t)c * H * W;
                 float* pad_c = padded + (size_t)c * pH * pW + pW + 1;
                 float* pad_row0 = padded + (size_t)c * pH * pW;
-                // 该通道的两条边界行/列清零由整体 memset 完成，这里只需拷贝主体
+                // ��ͨ���������߽���/������������ memset ��ɣ�����ֻ�追������?
                 memset(pad_row0, 0, pH * pW * sizeof(float));
                 for (int h = 0; h < H; h++) {
                     memcpy(pad_c + h * pW, in_c + h * W, W * sizeof(float));
@@ -1043,15 +1117,16 @@ static inline void conv3x3s1_winograd(const float* input, const float* weight, c
                     for (int t = 0; t < T; t++) {
                         int ht = t / w_tiles;
                         int wt = t % w_tiles;
-                        int oh = ht * 2, ow = wt * 2;
+                        int oh = ht * TS, ow = wt * TS;
                         const float* d_src = img_q + oh * pW + ow;
-                        float d_block[16];
-                        for (int r = 0; r < 4; r++)
-                            memcpy(d_block + r * 4, d_src + r * pW, 4 * sizeof(float));
-                        float v[16];
-                        winograd_input_transform(d_block, v);
+                        float d_block[36];
+                        for (int r = 0; r < D; r++)
+                            memcpy(d_block + r * D, d_src + r * pW, D * sizeof(float));
+                        float v[36];
+                        if (TS == 4) wino43_input_transform(d_block, v);
+                        else         winograd_input_transform(d_block, v);
                         float* dst = v_q;
-                        for (int k = 0; k < 16; k++, dst += (size_t)C_in * T) dst[t] = v[k];
+                        for (int k = 0; k < KT; k++, dst += (size_t)C_in * T) dst[t] = v[k];
                     }
                 }
             });
@@ -1062,24 +1137,25 @@ static inline void conv3x3s1_winograd(const float* input, const float* weight, c
                 for (int t = 0; t < T; t++) {
                     int ht = t / w_tiles;
                     int wt = t % w_tiles;
-                    int oh = ht * 2, ow = wt * 2;
+                    int oh = ht * TS, ow = wt * TS;
                     const float* d_src = img_q + oh * pW + ow;
-                    float d_block[16];
-                    for (int r = 0; r < 4; r++)
-                        memcpy(d_block + r * 4, d_src + r * pW, 4 * sizeof(float));
-                    float v[16];
-                    winograd_input_transform(d_block, v);
+                    float d_block[36];
+                    for (int r = 0; r < D; r++)
+                        memcpy(d_block + r * D, d_src + r * pW, D * sizeof(float));
+                    float v[36];
+                    if (TS == 4) wino43_input_transform(d_block, v);
+                    else         winograd_input_transform(d_block, v);
                     float* dst = v_q;
-                    for (int k = 0; k < 16; k++, dst += (size_t)C_in * T) dst[t] = v[k];
+                    for (int k = 0; k < KT; k++, dst += (size_t)C_in * T) dst[t] = v[k];
                 }
             }
         }
 
-        // 4. 16 个小 GEMM：M[k] = U[k] × V[k]（按 k 并行，内部串行避免嵌套并行）
+        // 4. KT ��С GEMM��M[k] = U[k] �� V[k]���� k ���У��ڲ����б���Ƕ�ײ��У�
         SimpleThreadPool& pool = SimpleThreadPool::instance();
-        bool gemm_mt = ((long long)16 * C_out * T * C_in > 500000 && pool.num_threads() > 1);
+        bool gemm_mt = ((long long)KT * C_out * T * C_in > 500000 && pool.num_threads() > 1);
         if (gemm_mt) {
-            pool.parallel_for(16, [&](int k) {
+            pool.parallel_for(KT, [&](int k) {
                 gemm_nm_core(V + (size_t)k * C_in * T,
                              U + (size_t)k * C_out * C_in,
                              nullptr,
@@ -1087,7 +1163,7 @@ static inline void conv3x3s1_winograd(const float* input, const float* weight, c
                              C_out, T, C_in, false);
             });
         } else {
-            for (int k = 0; k < 16; k++) {
+            for (int k = 0; k < KT; k++) {
                 gemm_nm_core(V + (size_t)k * C_in * T,
                              U + (size_t)k * C_out * C_in,
                              nullptr,
@@ -1096,7 +1172,7 @@ static inline void conv3x3s1_winograd(const float* input, const float* weight, c
             }
         }
 
-        // 5. 输出变换 + bias + SiLU + 写回（按输出通道分块并行）
+        // 5. �����?+ bias + SiLU + д�أ������ͨ���ֿ鲢�У�?
         const int PC = 8;
         int pblocks = (C_out + PC - 1) / PC;
         bool out_mt = ((long long)C_out * T > 8192 && pool.num_threads() > 1);
@@ -1106,23 +1182,24 @@ static inline void conv3x3s1_winograd(const float* input, const float* weight, c
             for (int t = 0; t < T; t++) {
                 int ht = t / w_tiles;
                 int wt = t % w_tiles;
-                int oh = ht * 2, ow = wt * 2;
+                int oh = ht * TS, ow = wt * TS;
                 for (int p = p_begin; p < p_end; p++) {
-                    float m[16], y[4];
-                    for (int k = 0; k < 16; k++) {
+                    float m[36], y[16];
+                    for (int k = 0; k < KT; k++) {
                         m[k] = Mbuf[((size_t)k * C_out + p) * T + t];
                     }
-                    winograd_output_transform(m, y);
+                    if (TS == 4) wino43_output_transform(m, y);
+                    else         winograd_output_transform(m, y);
                     float b = bias ? bias[p] : 0.0f;
-                    for (int i = 0; i < 4; i++) {
+                    for (int i = 0; i < TS * TS; i++) {
                         float val = y[i] + b;
                         if (apply_silu) val = val / (1.0f + fast_exp(-val));
                         y[i] = val;
                     }
                     float* out_p = out_n + (size_t)p * outH * outW;
-                    for (int dh = 0; dh < 2 && oh + dh < outH; dh++) {
-                        for (int dw = 0; dw < 2 && ow + dw < outW; dw++) {
-                            out_p[(oh + dh) * outW + (ow + dw)] = y[dh * 2 + dw];
+                    for (int dh = 0; dh < TS && oh + dh < outH; dh++) {
+                        for (int dw = 0; dw < TS && ow + dw < outW; dw++) {
+                            out_p[(oh + dh) * outW + (ow + dw)] = y[dh * TS + dw];
                         }
                     }
                 }
@@ -1136,11 +1213,23 @@ static inline void conv3x3s1_winograd(const float* input, const float* weight, c
     }
 }
 
-// 权重变换：U = G * g * G^T，g 是 3x3，U 是 4x4
+// Winograd ��ڣ�mode 0=�Զ�����ͨ����ѡ F(2,3)/F(4,3)����1=ǿ�� F(2,3)��2=ǿ�� F(4,3)
+// F(4,3) �� GEMM �������� F(2,3) �� 56%�����任����������
+// ���� C_in*C_out �㹻�󣨱任ռ�ȿɺ��ԣ�ʱ����
+static inline void conv3x3s1_winograd(const float* input, const float* weight, const float* bias,
+                                      float* output, bool apply_silu,
+                                      int N, int C_in, int H, int W, int C_out,
+                                      int mode = 0) {
+    bool f4 = (mode == 2) || (mode == 0 && (long long)C_in * C_out >= 2048);
+    if (f4) conv3x3s1_wino_tmpl<4>(input, weight, bias, output, apply_silu, N, C_in, H, W, C_out);
+    else    conv3x3s1_wino_tmpl<2>(input, weight, bias, output, apply_silu, N, C_in, H, W, C_out);
+}
+
+// Ȩ�ر任��U = G * g * G^T��g �� 3x3��U �� 4x4
 static inline void winograd_weight_transform(const float* g, float* U) {
     // G = [[1,0,0],[0.5,0.5,0.5],[0.5,-0.5,0.5],[0,0,1]]
     float tmp[4][3];
-    // tmp = G * g：按列 j 循环，tmp[i][j] = sum_k G[i][k] * g[k][j]
+    // tmp = G * g������ j ѭ����tmp[i][j] = sum_k G[i][k] * g[k][j]
     for (int j = 0; j < 3; j++) {
         float g0 = g[0*3+j], g1 = g[1*3+j], g2 = g[2*3+j];
         tmp[0][j] = g0;
@@ -1148,7 +1237,7 @@ static inline void winograd_weight_transform(const float* g, float* U) {
         tmp[2][j] = 0.5f * (g0 - g1 + g2);
         tmp[3][j] = g2;
     }
-    // U = tmp * G^T：按行 i 循环，U[i][j] = sum_k tmp[i][k] * G[j][k]
+    // U = tmp * G^T������ i ѭ����U[i][j] = sum_k tmp[i][k] * G[j][k]
     for (int i = 0; i < 4; i++) {
         float t0 = tmp[i][0], t1 = tmp[i][1], t2 = tmp[i][2];
         U[i*4+0] = t0;
@@ -1158,39 +1247,39 @@ static inline void winograd_weight_transform(const float* g, float* U) {
     }
 }
 
-// 输入变换：V = BT * d * BT^T，d 是 4x4，V 是 4x4
+// ����任��V = BT * d * BT^T��d �� 4x4��V �� 4x4
 static inline void winograd_input_transform(const float* d, float* V) {
     // BT = [[1,0,-1,0],[0,1,1,0],[0,-1,1,0],[0,1,0,-1]]
     float tmp[4][4];
-    // 行变换：tmp = BT * d
+    // �б任��tmp = BT * d
     for (int c = 0; c < 4; c++) {
         float d0 = d[0*4+c], d1 = d[1*4+c], d2 = d[2*4+c], d3 = d[3*4+c];
         tmp[0][c] = d0 - d2;
         tmp[1][c] = d1 + d2;
         tmp[2][c] = -d1 + d2;
-        tmp[3][c] = d1 - d3;  // 修正：BT第4行是[0,1,0,-1]，所以是 d1 - d3
+        tmp[3][c] = d1 - d3;  // ������BT��4����[0,1,0,-1]�������� d1 - d3
     }
-    // 列变换：V = tmp * BT^T
+    // �б任��V = tmp * BT^T
     for (int r = 0; r < 4; r++) {
         float t0 = tmp[r][0], t1 = tmp[r][1], t2 = tmp[r][2], t3 = tmp[r][3];
         V[r*4+0] = t0 - t2;
         V[r*4+1] = t1 + t2;
         V[r*4+2] = -t1 + t2;
-        V[r*4+3] = t1 - t3;  // 修正：BT^T的第4列是[0,1,0,-1]^T
+        V[r*4+3] = t1 - t3;  // ������BT^T�ĵ�4����[0,1,0,-1]^T
     }
 }
 
-// 输出变换：Y = AT * M * AT^T，M 是 4x4，Y 是 2x2
+// ����任��Y = AT * M * AT^T��M �� 4x4��Y �� 2x2
 static inline void winograd_output_transform(const float* M, float* Y) {
     // AT = [[1,1,1,0],[0,1,-1,-1]]
     float tmp[2][4];
-    // 行变换：tmp = AT * M
+    // �б任��tmp = AT * M
     for (int c = 0; c < 4; c++) {
         float m0 = M[0*4+c], m1 = M[1*4+c], m2 = M[2*4+c], m3 = M[3*4+c];
         tmp[0][c] = m0 + m1 + m2;
         tmp[1][c] = m1 - m2 - m3;
     }
-    // 列变换：Y = tmp * AT^T
+    // �б任��Y = tmp * AT^T
     for (int r = 0; r < 2; r++) {
         float t0 = tmp[r][0], t1 = tmp[r][1], t2 = tmp[r][2], t3 = tmp[r][3];
         Y[r*2+0] = t0 + t1 + t2;
@@ -1198,7 +1287,76 @@ static inline void winograd_output_transform(const float* M, float* Y) {
     }
 }
 
-// im2col: 把 NCHW 输入转换成列矩阵
+// ============================================================
+// Winograd F(4,3)��6x6 tile ���?4x4���˷� 36/16=2.25 ÿ���?
+// ��F(2,3) Ϊ 4 ÿ�������GEMM �׶μ��������� 56%
+// ����ȡ�� Lavin & Gray (2016)�����з���ϵ������Ȩ�ر任 G �У����ߣ���
+// ����ʱ������/�����?BT/AT ��Ϊ����ϵ��
+// ============================================================
+static inline void wino43_weight_transform(const float* g, float* U /*36*/) {
+    static const float G[6][3] = {
+        { 1.0f/4,   0.f,     0.f   },
+        {-1.0f/6, -1.0f/6, -1.0f/6},
+        {-1.0f/6,  1.0f/6, -1.0f/6},
+        { 1.0f/24, 1.0f/12, 1.0f/6},
+        { 1.0f/24,-1.0f/12, 1.0f/6},
+        { 0.f,     0.f,     1.f   }};
+    float tmp[6][3];
+    for (int j = 0; j < 3; j++) {
+        float g0 = g[0*3+j], g1 = g[1*3+j], g2 = g[2*3+j];
+        for (int i = 0; i < 6; i++)
+            tmp[i][j] = G[i][0]*g0 + G[i][1]*g1 + G[i][2]*g2;
+    }
+    for (int i = 0; i < 6; i++)
+        for (int k = 0; k < 6; k++)
+            U[i*6+k] = tmp[i][0]*G[k][0] + tmp[i][1]*G[k][1] + tmp[i][2]*G[k][2];
+}
+
+static inline void wino43_input_transform(const float* d /*36*/, float* V /*36*/) {
+    static const float BT[6][6] = {
+        { 4,  0, -5,  0,  1,  0},
+        { 0, -4, -4,  1,  1,  0},
+        { 0,  4, -4, -1,  1,  0},
+        { 0, -2, -1,  2,  1,  0},
+        { 0,  2, -1, -2,  1,  0},
+        { 0,  4,  0, -5,  0,  1}};
+    float tmp[6][6];
+    // tmp = BT * d
+    for (int c = 0; c < 6; c++) {
+        float d0=d[0*6+c], d1=d[1*6+c], d2=d[2*6+c], d3=d[3*6+c], d4=d[4*6+c], d5=d[5*6+c];
+        for (int i = 0; i < 6; i++)
+            tmp[i][c] = BT[i][0]*d0 + BT[i][1]*d1 + BT[i][2]*d2 + BT[i][3]*d3 + BT[i][4]*d4 + BT[i][5]*d5;
+    }
+    // V = tmp * BT^T
+    for (int i = 0; i < 6; i++) {
+        float t0=tmp[i][0], t1=tmp[i][1], t2=tmp[i][2], t3=tmp[i][3], t4=tmp[i][4], t5=tmp[i][5];
+        for (int j = 0; j < 6; j++)
+            V[i*6+j] = BT[j][0]*t0 + BT[j][1]*t1 + BT[j][2]*t2 + BT[j][3]*t3 + BT[j][4]*t4 + BT[j][5]*t5;
+    }
+}
+
+static inline void wino43_output_transform(const float* M /*36*/, float* Y /*16*/) {
+    static const float AT[4][6] = {
+        {1, 1, 1, 1, 1, 0},
+        {0, 1,-1, 2,-2, 0},
+        {0, 1, 1, 4, 4, 0},
+        {0, 1,-1, 8,-8, 1}};
+    float tmp[4][6];
+    // tmp = AT * M
+    for (int c = 0; c < 6; c++) {
+        float m0=M[0*6+c], m1=M[1*6+c], m2=M[2*6+c], m3=M[3*6+c], m4=M[4*6+c], m5=M[5*6+c];
+        for (int i = 0; i < 4; i++)
+            tmp[i][c] = AT[i][0]*m0 + AT[i][1]*m1 + AT[i][2]*m2 + AT[i][3]*m3 + AT[i][4]*m4 + AT[i][5]*m5;
+    }
+    // Y = tmp * AT^T
+    for (int i = 0; i < 4; i++) {
+        float t0=tmp[i][0], t1=tmp[i][1], t2=tmp[i][2], t3=tmp[i][3], t4=tmp[i][4], t5=tmp[i][5];
+        for (int j = 0; j < 4; j++)
+            Y[i*4+j] = AT[j][0]*t0 + AT[j][1]*t1 + AT[j][2]*t2 + AT[j][3]*t3 + AT[j][4]*t4 + AT[j][5]*t5;
+    }
+}
+
+// im2col: �� NCHW ����ת�����о���
 // input: [N, C, H, W], output: [N*outH*outW, C*kH*kW]
 static inline void im2col(const float* input, float* output,
                            int N, int C, int H, int W,
@@ -1232,8 +1390,8 @@ static inline void im2col(const float* input, float* output,
     }
 }
 
-// im2col（K 外层布局）：output 为 [C*kH*kW, N*outH*outW]，即 [K, M]
-// 与 gemm_nm 的 X 输入布局一致，GEMM 阶段无需转置
+// im2col��K ��㲼�֣���output Ϊ [C*kH*kW, N*outH*outW]���� [K, M]
+// �� gemm_nm �� X ���벼��һ�£�GEMM �׶�����ת��
 static inline void im2col_km(const float* input, float* output,
                               int N, int C, int H, int W,
                               int kH, int kW, int strideH, int strideW,
@@ -1284,6 +1442,9 @@ static inline void im2col_km(const float* input, float* output,
 // ============================================================
 static inline void op_conv(const Tensor& input, const Tensor& weight, const Tensor* bias,
                            Tensor& output, const ConvAttr& attr, bool apply_silu = false) {
+    // 调试开关：TINY_YOLO_NO_SILU=1 时禁用所有融合 SiLU（定位数值问题用）
+    static const bool g_no_silu = (getenv("TINY_YOLO_NO_SILU") != nullptr);
+    if (g_no_silu) apply_silu = false;
     int N = input.shape[0];
     int C_in = input.shape[1];
     int H = input.shape[2];
@@ -1298,11 +1459,23 @@ static inline void op_conv(const Tensor& input, const Tensor& weight, const Tens
 
     output.alloc({N, C_out, outH, outW});
 
+    // NaN 定位探针：打印首�?Conv 的实际属性，确认分发路径
+    {
+        static const bool nan_probe0 = (getenv("TINY_YOLO_NAN_DEBUG") != nullptr);
+        static int probe_count = 0;
+        if (nan_probe0 && probe_count < 2) {
+            probe_count++;
+            printf("[conv] k=%dx%d s=%d,%d p=%d,%d dil=%d,%d group=%d | in=%dx%dx%dx%d w=%d -> out=%dx%d\n",
+                   kH, kW, attr.stride_h, attr.stride_w, attr.pad_h, attr.pad_w,
+                   attr.dilation_h, attr.dilation_w, group, N, C_in, H, W, C_out, outH, outW);
+        }
+    }
+
     if (group == 1) {
         int col_size = C_in * kH * kW;
         int M = outH * outW;
 
-        // 3x3 s1 p1：Winograd（SiLU 融合在输出变换阶段）
+        // 3x3 s1 p1��Winograd��SiLU �ں�������任�׶Σ�?
         bool is_3x3s1p1 = (kH == 3 && kW == 3 && attr.stride_h == 1 && attr.stride_w == 1
                             && attr.pad_h == 1 && attr.pad_w == 1 && attr.dilation_h == 1 && attr.dilation_w == 1);
 
@@ -1312,7 +1485,7 @@ static inline void op_conv(const Tensor& input, const Tensor& weight, const Tens
             return;
         }
 
-        // 1x1 s1 p0：输入本身就是 [K=C_in, M] 布局，直接 GEMM，无需转置
+        // 1x1 s1 p0�����뱾������ [K=C_in, M] ���֣�ֱ�� GEMM������ת��
         bool is_1x1 = (kH == 1 && kW == 1 && attr.stride_h == 1 && attr.stride_w == 1
                         && attr.pad_h == 0 && attr.pad_w == 0 && attr.dilation_h == 1 && attr.dilation_w == 1);
 
@@ -1323,28 +1496,49 @@ static inline void op_conv(const Tensor& input, const Tensor& weight, const Tens
                 gemm_nm(in_n, weight.data, bias ? bias->data : nullptr,
                         out_n, C_out, M, C_in, apply_silu);
             }
-        } else if (false && kH == 3 && kW == 3 && attr.stride_h == 2 && attr.stride_w == 2
-                   && attr.pad_h == 1 && attr.pad_w == 1 && attr.dilation_h == 1 && attr.dilation_w == 1) {
-            conv3x3s2p1(input.data, weight.data, bias ? bias->data : nullptr,
-                        output.data, N, C_in, H, W, C_out, apply_silu);
-            return;
+        // ע��3x3 s2 ֱ�Ӿ���·�����޸���������ԭʵ������������SiLU �� q ѭ������ͨ��
+        // Ӧ�ã�AVX �ڲ㰴 s1 ��ʽ�������أ�δ���� stride=2 ʱ����������������?2����
+        // ʵ���� Ryzen 5560U �϶������Բ��� im2col_km + gemm_nm(AVX2) ��ϣ���Ĭ�Ͻ��ã�?
+        // �������ã��ָ��·� else-if ������ȥ�� false &&������ test_s2.exe ��֤��
         } else {
-            // 普通卷积：im2col 成 [K, M] 布局 + gemm_nm
+            // 普通卷积：im2col �?[K, M] 布局 + gemm_nm
             size_t col_numel = (size_t)N * M * col_size;
             float* col = get_temp_buf(col_numel);
             im2col_km(input.data, col, N, C_in, H, W, kH, kW,
                       attr.stride_h, attr.stride_w, attr.pad_h, attr.pad_w,
                       attr.dilation_h, attr.dilation_w, outH, outW);
 
+            // NaN 定位探针（TINY_YOLO_NAN_DEBUG=1）：检�?im2col 输出与各阶段结果
+            static const bool nan_probe = (getenv("TINY_YOLO_NAN_DEBUG") != nullptr);
+            if (nan_probe) {
+                size_t cn = 0;
+                for (size_t q = 0; q < col_numel; q++) if (_isnan(col[q])) cn++;
+                if (cn) printf("[probe] after im2col: col nan=%zu (col_numel=%zu)\n", cn, col_numel);
+                // 检查输�?
+                size_t inan = 0;
+                size_t in_numel = (size_t)N * C_in * H * W;
+                for (size_t q = 0; q < in_numel; q++) if (_isnan(input.data[q])) inan++;
+                if (inan) printf("[probe] conv input nan=%zu\n", inan);
+            }
+
             for (int n = 0; n < N; n++) {
                 float* col_n = col + (size_t)n * M * col_size;
                 float* out_n = output.data + (size_t)n * C_out * M;
                 gemm_nm(col_n, weight.data, bias ? bias->data : nullptr,
                         out_n, C_out, M, col_size, apply_silu);
+                if (nan_probe) {
+                    size_t on = 0; int bad_ch = -1, nbad_ch = 0;
+                    for (int c = 0; c < C_out; c++) {
+                        size_t cn2 = 0;
+                        for (int q = 0; q < M; q++) if (_isnan(out_n[(size_t)c * M + q])) cn2++;
+                        if (cn2) { nbad_ch++; if (bad_ch < 0) bad_ch = c; on += cn2; }
+                    }
+                    if (on) printf("[probe] after gemm+silu: out nan=%zu in %d channels (first ch=%d)\n", on, nbad_ch, bad_ch);
+                }
             }
         }
     } else {
-        // 分组卷积（逐组处理）
+        // ������������鴦����?
         int C_per_group = C_in / group;
         int C_out_per_group = C_out / group;
         int col_size = C_per_group * kH * kW;
@@ -1354,15 +1548,15 @@ static inline void op_conv(const Tensor& input, const Tensor& weight, const Tens
         size_t max_numel = col_numel > group_input_numel ? col_numel : group_input_numel;
 
         float* col = get_temp_buf(max_numel);
-        float* group_input = col + col_numel;  // 复用缓冲区的后半部分（如果够大）
+        float* group_input = col + col_numel;  // ���û������ĺ�벿�֣��������
         bool need_separate = (col_numel + group_input_numel > max_numel);
         if (need_separate) {
-            // 不够大，单独分配
+            // �����󣬵�������
             group_input = (float*)malloc(group_input_numel * sizeof(float));
         }
 
         for (int g = 0; g < group; g++) {
-            // 提取该组的输入
+            // ��ȡ���������?
             for (int n = 0; n < N; n++)
                 for (int c = 0; c < C_per_group; c++)
                     memcpy(group_input + (n * C_per_group + c) * H * W,
@@ -1373,14 +1567,14 @@ static inline void op_conv(const Tensor& input, const Tensor& weight, const Tens
                    attr.stride_h, attr.stride_w, attr.pad_h, attr.pad_w,
                    attr.dilation_h, attr.dilation_w, outH, outW);
 
-            // 该组的权重
+            // �����Ȩ��?
             const float* group_weight = weight.data + (size_t)g * C_out_per_group * col_size;
             const float* group_bias = bias ? bias->data + g * C_out_per_group : nullptr;
 
             for (int n = 0; n < N; n++) {
                 float* col_n = col + (size_t)n * M * col_size;
                 float* out_n = output.data + (size_t)n * C_out * M + (size_t)g * C_out_per_group * M;
-                // 使用 gemm_nc 直接输出 [C_out_per_group, M] 布局
+                // ʹ�� gemm_nc ֱ�����?[C_out_per_group, M] ����
                 gemm_nc(col_n, group_weight, group_bias, out_n, M, C_out_per_group, col_size);
                 if (apply_silu) {
                     for (int i = 0; i < C_out_per_group * M; i++) {
@@ -1395,13 +1589,16 @@ static inline void op_conv(const Tensor& input, const Tensor& weight, const Tens
 }
 
 // ============================================================
-// 激活函数
+// �����
 // ============================================================
-// 快速 exp 近似（Schraudolph方法，精度足够推理用，比expf快很多）
+// ���� exp ���ƣ�Schraudolph�����������㹻�����ã���expf��ܶ�?
 static inline float fast_exp(float x) {
-    if (x > 88.0f) return 1e30f;
-    if (x < -88.0f) return 0.0f;
-    // Schraudolph近似：利用IEEE754浮点数的指数位
+    // 注意：Schraudolph 近似�?x < -87.9895 时整数结果变负，reinterpret �?float 会得�?
+    // 指数位全 1 �?NaN（毒区）。钳制阈值必须留足余量（86 距毒区约 2.0），否则
+    // 大激活值经 SiLU/sigmoid 会产�?NaN 并向下游扩散（yolo12n 自定义模型曾踩中�?
+    if (x > 86.0f) return 1e30f;
+    if (x < -86.0f) return 0.0f;
+    // Schraudolph���ƣ�����IEEE754��������ָ��λ
     union { float f; int32_t i; } u;
     u.i = (int32_t)(12102203.0f * x + 1064866805.0f);
     return u.f;
@@ -1438,7 +1635,7 @@ static inline void op_exp(const Tensor& input, Tensor& output) {
 }
 
 // ============================================================
-// 元素级运算（支持广播）
+// Ԫ�ؼ����㣨֧�ֹ㲥��
 // ============================================================
 static inline void broadcast_shape(const std::vector<int>& a, const std::vector<int>& b,
                                     std::vector<int>& out) {
@@ -1455,7 +1652,7 @@ static inline void broadcast_shape(const std::vector<int>& a, const std::vector<
 
 static inline int broadcast_index(int flat_idx, const std::vector<int>& out_shape,
                                    const std::vector<int>& in_shape) {
-    // 把输出的扁平索引转换为输入的扁平索引（处理广播）
+    // ������ı�ƽ����ת��Ϊ����ı�ƽ�����������㲥��
     int result = 0;
     int stride = 1;
     int offset = (int)out_shape.size() - (int)in_shape.size();
@@ -1498,7 +1695,7 @@ static inline void op_elementwise(const Tensor& a, const Tensor& b, Tensor& outp
         return;
     }
 
-    // 快速路径 1：形状相同，直接逐元素运算
+    // ����·�� 1����״��ͬ��ֱ����Ԫ������
     if (a.ndim == b.ndim && a.shape == b.shape) {
         const float* pa = a.data;
         const float* pb = b.data;
@@ -1521,7 +1718,7 @@ static inline void op_elementwise(const Tensor& a, const Tensor& b, Tensor& outp
         return;
     }
 
-    // 快速路径 2：a 是标量
+    // ����·�� 2��a �Ǳ���
     if (a_scalar) {
         float va = read_tensor_val(a, 0);
         const float* pb = b.data;
@@ -1544,7 +1741,7 @@ static inline void op_elementwise(const Tensor& a, const Tensor& b, Tensor& outp
         return;
     }
 
-    // 快速路径 3：b 是标量
+    // ����·�� 3��b �Ǳ���
     if (b_scalar) {
         float vb = read_tensor_val(b, 0);
         const float* pa = a.data;
@@ -1567,7 +1764,7 @@ static inline void op_elementwise(const Tensor& a, const Tensor& b, Tensor& outp
         return;
     }
 
-    // 通用路径：广播
+    // ͨ��·�����㲥
     for (int i = 0; i < output.numel; i++) {
         float va = read_tensor_val(a, broadcast_index(i, out_shape, a.shape));
         float vb = read_tensor_val(b, broadcast_index(i, out_shape, b.shape));
@@ -1586,7 +1783,7 @@ static inline void op_elementwise(const Tensor& a, const Tensor& b, Tensor& outp
 // Concat
 // ============================================================
 static inline void op_concat(const std::vector<Tensor*>& inputs, Tensor& output, int axis) {
-    // 规范化 axis（支持负数）
+    // �淶�� axis��֧�ָ�����
     int ndim = inputs[0]->ndim;
     if (axis < 0) axis += ndim;
 
@@ -1596,13 +1793,13 @@ static inline void op_concat(const std::vector<Tensor*>& inputs, Tensor& output,
     out_shape[axis] = total_axis;
     output.alloc(out_shape);
 
-    // 计算每个输入在输出中的偏移
+    // ����ÿ������������е�ƫ��?
     int offset = 0;
     SimpleThreadPool& pool_ = SimpleThreadPool::instance();
     bool cmt = (pool_.num_threads() > 1 && (size_t)output.numel * sizeof(float) >= 262144);
     for (auto* inp : inputs) {
         int in_axis_size = inp->shape[axis];
-        // 逐元素复制
+        // ��Ԫ�ظ���
         int outer = 1;
         for (int i = 0; i < axis; i++) outer *= out_shape[i];
         int inner = 1;
@@ -1631,7 +1828,7 @@ static inline void op_concat(const std::vector<Tensor*>& inputs, Tensor& output,
 }
 
 // ============================================================
-// Resize (双线性插值，最近邻也支持)
+// Resize (˫���Բ�ֵ�������Ҳ֧��?
 // ============================================================
 static inline void op_resize(const Tensor& input, Tensor& output,
                               int outH, int outW, const char* mode) {
@@ -1644,8 +1841,8 @@ static inline void op_resize(const Tensor& input, Tensor& output,
     float scaleH = (float)H / outH;
     float scaleW = (float)W / outW;
 
-    // 特化路径：2 倍最近邻上采样（YOLO 上采样的最常见情况）
-    // 每个源行水平复制 2 倍后整行写两遍，内存带宽最优
+    // �ػ�·����2 ��������ϲ�����YOLO �ϲ�������������?
+    // ÿ��Դ��ˮƽ���� 2 ��������д���飬�ڴ��������?
     if (mode[0] == 'n' && outH == H * 2 && outW == W * 2) {
         for (int n = 0; n < N; n++) {
             for (int c = 0; c < C; c++) {
@@ -1671,12 +1868,12 @@ static inline void op_resize(const Tensor& input, Tensor& output,
             for (int oh = 0; oh < outH; oh++) {
                 for (int ow = 0; ow < outW; ow++) {
                     if (mode[0] == 'n') {
-                        // 最近邻
+                        // �����?
                         int ih = std::min((int)(oh * scaleH), H - 1);
                         int iw = std::min((int)(ow * scaleW), W - 1);
                         output.at(n, c, oh, ow) = input.at(n, c, ih, iw);
                     } else {
-                        // 双线性 (ONNX half_pixel / PyTorch align_corners=False)
+                        // ˫���� (ONNX half_pixel / PyTorch align_corners=False)
                         float fh = (oh + 0.5f) * scaleH - 0.5f;
                         float fw = (ow + 0.5f) * scaleW - 0.5f;
                         int h0 = (int)floorf(fh);
@@ -1704,8 +1901,8 @@ static inline void op_resize(const Tensor& input, Tensor& output,
 // ============================================================
 // Transpose
 // ============================================================
-// AVX2 8x8 float 块转置：in[r][c] -> out[c][r]
-// in 行主序（行距 lda），out 行主序（行距 ldb）
+// AVX2 8x8 float ��ת�ã�in[r][c] -> out[c][r]
+// in �������о� lda����out �������о� ldb��
 static inline void transpose8x8_ps(const float* in, size_t lda, float* out, size_t ldb) {
     __m256 r0 = _mm256_loadu_ps(in + 0 * lda);
     __m256 r1 = _mm256_loadu_ps(in + 1 * lda);
@@ -1746,7 +1943,7 @@ static inline void op_transpose(const Tensor& input, Tensor& output, const std::
     for (size_t i = 0; i < perm.size(); i++) out_shape[i] = input.shape[perm[i]];
     output.alloc(out_shape);
 
-    // 快速路径：3D 矩阵转置 perm=[0,2,1]（注意力块常见）
+    // ����·����3D ����ת�� perm=[0,2,1]��ע�����鳣����
     if (input.ndim == 3 && perm.size() == 3 && perm[0] == 0 && perm[1] == 2 && perm[2] == 1) {
         int R = input.shape[1], Cc = input.shape[2];
         const float* in3 = input.data;
@@ -1761,10 +1958,10 @@ static inline void op_transpose(const Tensor& input, Tensor& output, const std::
             for (; c < Cc; c++)
                 for (int i = r0; i < std::min(R, r0 + 8); i++)
                     out3[(size_t)c * R + i] = in3[(size_t)i * Cc + c];
-            // 行尾不足 8 的列已由上面 c 循环覆盖；这里补行块尾部
+            // ��β���� 8 ������������ c ѭ�����ǣ����ﲹ�п�β��
         };
         int rb = (R + 7) / 8;
-        // 列方向也分块以提升并行度
+        // �з���Ҳ�ֿ����������ж�
         int cbt = (Cc + 7) / 8;
         if (t3 && rb * cbt >= 2) {
             int tasks = rb * cbt;
@@ -1786,7 +1983,7 @@ static inline void op_transpose(const Tensor& input, Tensor& output, const std::
         return;
     }
 
-    // 快速路径：4D 张量的常见转置模式
+    // ����·����4D �����ĳ���ת��ģʽ
     if (input.ndim == 4 && perm.size() == 4) {
         int N = input.shape[0], C = input.shape[1], H = input.shape[2], W = input.shape[3];
         const float* in = input.data;
@@ -1794,14 +1991,14 @@ static inline void op_transpose(const Tensor& input, Tensor& output, const std::
         SimpleThreadPool& pool_ = SimpleThreadPool::instance();
         bool tmt = (pool_.num_threads() > 1 && (size_t)input.numel >= 65536);
 
-        // perm = [0,2,3,1]: NCHW -> NHWC（按 (n,h) 输出行块并行）
+        // perm = [0,2,3,1]: NCHW -> NHWC���� (n,h) ����п鲢�У�?
         if (perm[0]==0 && perm[1]==2 && perm[2]==3 && perm[3]==1) {
             int rows = N * H;
             auto body = [&](int r) {
                 int n = r / H, h = r % H;
                 const float* in_row = in + (size_t)n * C * H * W + (size_t)h * W;
                 float* out_row = out + ((size_t)n * H + h) * W * C;
-                // 8x8 块转置：8 通道 × 8 个 w
+                // 8x8 ��ת�ã�8 ͨ�� �� 8 �� w
                 int c = 0;
                 for (; c + 8 <= C; c += 8) {
                     const float* ib = in_row + (size_t)c * H * W;
@@ -1823,11 +2020,11 @@ static inline void op_transpose(const Tensor& input, Tensor& output, const std::
             else { for (int r = 0; r < rows; r++) body(r); }
             return;
         }
-        // perm = [0,3,1,2]: NHWC -> NCHW（N=1 时按通道范围分块）
+        // perm = [0,3,1,2]: NHWC -> NCHW��N=1 ʱ��ͨ����Χ�ֿ飩
         if (perm[0]==0 && perm[1]==3 && perm[2]==1 && perm[3]==2) {
             int H2 = input.shape[1], W2 = input.shape[2], C2 = input.shape[3];
             size_t plane = (size_t)H2 * W2;
-            // 8x8 块转置：8 个 i(=h*W+w) × 8 通道
+            // 8x8 ��ת�ã�8 �� i(=h*W+w) �� 8 ͨ��
             auto body = [&](int n) {
                 const float* in_n = in + (size_t)n * plane * C2;
                 float* out_n = out + (size_t)n * C2 * plane;
@@ -1869,7 +2066,7 @@ static inline void op_transpose(const Tensor& input, Tensor& output, const std::
             }
             return;
         }
-        // perm = [0,1,3,2]: 转置最后两维（按通道行并行）
+        // perm = [0,1,3,2]: ת�������ά����ͨ���в��У�?
         if (perm[0]==0 && perm[1]==1 && perm[3]==2 && perm[2]==3) {
             auto body = [&](int nc) {
                 const float* in_ptr = in + (size_t)nc * H * W;
@@ -1887,7 +2084,7 @@ static inline void op_transpose(const Tensor& input, Tensor& output, const std::
         }
     }
 
-    // 通用路径：用步长计算（比扁平索引+取模快）
+    // ͨ��·�����ò������㣨�ȱ�ƽ����+ȡģ�죩
     std::vector<int> in_strides(input.ndim);
     int s = 1;
     for (int i = input.ndim - 1; i >= 0; i--) { in_strides[i] = s; s *= input.shape[i]; }
@@ -1896,22 +2093,22 @@ static inline void op_transpose(const Tensor& input, Tensor& output, const std::
     s = 1;
     for (int i = output.ndim - 1; i >= 0; i--) { out_strides[i] = s; s *= output.shape[i]; }
 
-    // 计算 perm 的逆映射：in_dim_to_out_dim
+    // ���� perm ����ӳ�䣺in_dim_to_out_dim
     std::vector<int> inv_perm(input.ndim);
     for (size_t i = 0; i < perm.size(); i++) inv_perm[perm[i]] = (int)i;
 
-    // 用嵌套循环转置（递归展开）
-    // 简化：用多维索引迭代器
+    // ��Ƕ��ѭ��ת�ã��ݹ�չ����
+    // �򻯣��ö�ά����������
     std::vector<int> out_idx(output.ndim, 0);
     for (int i = 0; i < output.numel; i++) {
-        // 计算输入扁平索引
+        // ���������ƽ����?
         int in_flat = 0;
         for (int d = 0; d < input.ndim; d++) {
             in_flat += out_idx[inv_perm[d]] * in_strides[d];
         }
         output.data[i] = input.data[in_flat];
 
-        // 递增输出多维索引
+        // ���������ά����?
         for (int d = output.ndim - 1; d >= 0; d--) {
             out_idx[d]++;
             if (out_idx[d] < output.shape[d]) break;
@@ -1924,10 +2121,10 @@ static inline void op_transpose(const Tensor& input, Tensor& output, const std::
 // Reshape
 // ============================================================
 static inline void op_reshape(const Tensor& input, Tensor& output, const std::vector<int>& new_shape) {
-    // 计算总元素数，处理 -1 和 0（ONNX中0表示保留原维度）
+    // ������Ԫ���������� -1 �� 0��ONNX��0��ʾ����ԭά�ȣ�
     std::vector<int> shape = new_shape;
 
-    // 先处理0维：从输入中复制对应维度
+    // �ȴ���0ά���������и��ƶ�Ӧά��
     for (size_t i = 0; i < shape.size() && i < (size_t)input.ndim; i++) {
         if (shape[i] == 0) {
             shape[i] = input.shape[i];
@@ -1942,11 +2139,11 @@ static inline void op_reshape(const Tensor& input, Tensor& output, const std::ve
     }
     if (neg_idx >= 0 && known > 0) shape[neg_idx] = input.numel / known;
 
-    output.reference(shape, input.data); // 引用同一块内存
+    output.reference(shape, input.data); // ����ͬһ���ڴ�
     output.own_data = false;
 }
 
-// MatMul 并行包装：按 M 行分块并行（块大小对齐到 matmul_avx 的 4 行展开）
+// MatMul ���а�װ���� M �зֿ鲢�У����С����?matmul_avx �� 4 ��չ����
 static inline void matmul_par(const float* A, const float* B, const float* bias,
                                float* C, int M, int N, int K) {
     long long macs = (long long)M * N * K;
@@ -1969,19 +2166,19 @@ static inline void matmul_par(const float* A, const float* B, const float* bias,
 // MatMul
 // ============================================================
 static inline void op_matmul(const Tensor& a, const Tensor& b, Tensor& output) {
-    // 支持 2D 和高维 batch matmul
+    // ֧�� 2D �͸�ά batch matmul
     int a_ndim = a.ndim, b_ndim = b.ndim;
     if (a_ndim == 2 && b_ndim == 2) {
         int M = a.shape[0], K = a.shape[1], N = b.shape[1];
         output.alloc({M, N});
         matmul_par(a.data, b.data, nullptr, output.data, M, N, K);
     } else {
-        // 高维：把前面的维度当作 batch
+        // ��ά����ǰ���ά�ȵ���?batch
         int K = a.shape[a_ndim - 1];
         int M = a.shape[a_ndim - 2];
         int N = b.shape[b_ndim - 1];
 
-        // 计算 batch 数（广播）
+        // ���� batch �����㲥��
         int batch_dims = std::max(a_ndim, b_ndim) - 2;
         std::vector<int> out_shape;
         for (int i = 0; i < batch_dims; i++) {
@@ -1997,7 +2194,7 @@ static inline void op_matmul(const Tensor& a, const Tensor& b, Tensor& output) {
         for (int d : out_shape) batch *= d;
         batch /= M * N;
 
-        // 批次数多时按 batch 并行
+        // ��������ʱ�� batch ����
         long long macs = (long long)batch * M * N * K;
         int workers = SimpleThreadPool::instance().num_threads();
         if (workers > 1 && batch >= 4 && macs > 2000000) {
@@ -2016,21 +2213,21 @@ static inline void op_matmul(const Tensor& a, const Tensor& b, Tensor& output) {
         }
 
         for (int b_idx = 0; b_idx < batch; b_idx++) {
-            // 找到 a 和 b 对应的 batch 索引（处理广播）
-            // a 可能有 batch 维度，b 可能是 2D（所有 batch 共享）
+            // �ҵ� a �� b ��Ӧ�� batch �����������㲥��
+            // a ������ batch ά�ȣ�b ������ 2D������ batch ������
             int a_batch_idx = b_idx;
             int b_batch_idx = b_idx;
             
-            // 计算 a 的总 batch 大小
+            // ���� a ���� batch ��С
             int a_total_batch = 1;
             for (int i = 0; i < a_ndim - 2; i++) a_total_batch *= a.shape[i];
-            // 计算 b 的总 batch 大小
+            // ���� b ���� batch ��С
             int b_total_batch = 1;
             for (int i = 0; i < b_ndim - 2; i++) b_total_batch *= b.shape[i];
             
-            // 如果 b 没有 batch 维度（2D），所有 batch 共享同一个 b
+            // ���?b û�� batch ά�ȣ�2D�������� batch ����ͬһ�� b
             if (b_total_batch == 1) b_batch_idx = 0;
-            // 如果 a 没有 batch 维度，所有 batch 共享同一个 a
+            // ���?a û�� batch ά�ȣ����� batch ����ͬһ�� a
             if (a_total_batch == 1) a_batch_idx = 0;
             
             const float* a_ptr = a.data + a_batch_idx * M * K;
@@ -2050,7 +2247,7 @@ static inline void op_split(const Tensor& input, std::vector<Tensor*>& outputs, 
     if (axis < 0) axis += ndim;
     int n_out = (int)outputs.size();
 
-    // 计算每个输出在 axis 维度的大小（优先级：传入的split_sizes > 输出张量已有的形状 > 等分）
+    // ����ÿ�������?axis ά�ȵĴ�С�����ȼ��������split_sizes > ����������е����?> �ȷ֣�
     std::vector<int> split_sizes(n_out);
     int total = 0;
     bool use_input_sizes = !split_sizes_in.empty() && (int)split_sizes_in.size() == n_out;
@@ -2074,7 +2271,7 @@ static inline void op_split(const Tensor& input, std::vector<Tensor*>& outputs, 
             }
         }
         if (!use_output_shape || total != input.shape[axis]) {
-            // 等分
+            // �ȷ�
             int split_size = input.shape[axis] / n_out;
             for (int o = 0; o < n_out; o++) split_sizes[o] = split_size;
         }
@@ -2122,13 +2319,13 @@ static inline void op_slice(const Tensor& input, Tensor& output,
                              const std::vector<int>& starts, const std::vector<int>& ends,
                              const std::vector<int>& axes, const std::vector<int>& steps) {
     std::vector<int> out_shape = input.shape;
-    // 归一化 starts/ends：处理负索引和 clamp
+    // ��һ�� starts/ends�������������� clamp
     std::vector<int> norm_starts = starts, norm_ends = ends;
     for (size_t i = 0; i < axes.size(); i++) {
         int ax = axes[i] < 0 ? axes[i] + input.ndim : axes[i];
         int dim = input.shape[ax];
         int step = i < steps.size() ? steps[i] : 1;
-        // 处理负索引
+        // ����������
         if (norm_starts[i] < 0) norm_starts[i] += dim;
         if (norm_ends[i] < 0) norm_ends[i] += dim;
         // clamp
@@ -2138,23 +2335,23 @@ static inline void op_slice(const Tensor& input, Tensor& output,
     }
     output.alloc(out_shape);
 
-    // 简化实现：逐元素复制
+    // ��ʵ�֣���Ԫ�ظ���
     for (int i = 0; i < output.numel; i++) {
-        // 输出扁平索引 -> 输出多维索引
+        // �����ƽ����?-> �����ά����?
         int idx = i;
         std::vector<int> out_idx(output.ndim);
         for (int d = output.ndim - 1; d >= 0; d--) {
             out_idx[d] = idx % output.shape[d];
             idx /= output.shape[d];
         }
-        // 转换为输入索引
+        // ת��Ϊ��������
         std::vector<int> in_idx = out_idx;
         for (size_t j = 0; j < axes.size(); j++) {
             int ax = axes[j] < 0 ? axes[j] + input.ndim : axes[j];
             int step = j < steps.size() ? steps[j] : 1;
             in_idx[ax] = norm_starts[j] + out_idx[ax] * step;
         }
-        // 计算输入扁平索引
+        // ���������ƽ����?
         int in_flat = 0;
         int stride = 1;
         for (int d = input.ndim - 1; d >= 0; d--) {
@@ -2188,32 +2385,32 @@ static inline void op_reduce(const Tensor& input, Tensor& output,
     }
     output.alloc(out_shape);
 
-    // 优化实现：用步长和循环嵌套
-    // 计算输入步长
+    // �Ż�ʵ�֣��ò�����ѭ��Ƕ��
+    // �������벽��
     std::vector<int> in_strides(input.ndim);
     int s = 1;
     for (int i = input.ndim - 1; i >= 0; i--) { in_strides[i] = s; s *= input.shape[i]; }
 
-    // 计算输出步长
+    // �����������?
     std::vector<int> out_strides(output.ndim);
     s = 1;
     for (int i = output.ndim - 1; i >= 0; i--) { out_strides[i] = s; s *= output.shape[i]; }
 
-    // 计算 reduce 维度的总大小和步长
+    // ���� reduce ά�ȵ��ܴ�С�Ͳ���
     int reduce_size = 1;
     for (int d = 0; d < input.ndim; d++)
         if (reduce_dim[d]) reduce_size *= input.shape[d];
 
-    // 预计算每个 reduce 索引对应的输入偏移
-    // 简化：用递归或迭代枚举 reduce 维度组合
-    // 对于常见情况（reduce 最后一维或连续维度），可以更高效
+    // Ԥ����ÿ�� reduce ������Ӧ������ƫ��
+    // �򻯣��õݹ�����ö�� reduce ά�����?
+    // ���ڳ��������reduce ���һά������ά�ȣ������Ը����?
 
-    // 通用实现：用多维索引迭代器
+    // ͨ��ʵ�֣��ö�ά����������
     std::vector<int> out_idx(output.ndim, 0);
     std::vector<int> in_idx(input.ndim, 0);
 
     for (int i = 0; i < output.numel; i++) {
-        // 建立输入索引（非 reduce 维度从输出索引映射）
+        // ���������������� reduce ά�ȴ��������ӳ��?
         int out_d = 0;
         for (int d = 0; d < input.ndim; d++) {
             if (!reduce_dim[d]) {
@@ -2221,24 +2418,24 @@ static inline void op_reduce(const Tensor& input, Tensor& output,
             }
         }
 
-        // 计算基础输入偏移（非 reduce 维度）
+        // �����������ƫ�ƣ���?reduce ά�ȣ�
         int base_offset = 0;
         for (int d = 0; d < input.ndim; d++) {
             if (!reduce_dim[d]) base_offset += in_idx[d] * in_strides[d];
         }
 
-        // 枚举 reduce 维度的所有组合
+        // ö�� reduce ά�ȵ��������?
         float result = is_max ? -1e30f : 0.0f;
 
-        // 用递归或迭代枚举 reduce 维度
-        // 简化：用扁平索引 + 解码（但只对 reduce 维度）
+        // �õݹ�����ö�� reduce ά��
+        // �򻯣��ñ�ƽ���� + ���루��ֻ�� reduce ά�ȣ�
         std::vector<int> red_axes;
         for (int d = 0; d < input.ndim; d++)
             if (reduce_dim[d]) red_axes.push_back(d);
 
         std::vector<int> red_idx(red_axes.size(), 0);
         for (int r = 0; r < reduce_size; r++) {
-            // 计算输入偏移
+            // ��������ƫ��
             int offset = base_offset;
             for (size_t j = 0; j < red_axes.size(); j++) {
                 offset += red_idx[j] * in_strides[red_axes[j]];
@@ -2248,7 +2445,7 @@ static inline void op_reduce(const Tensor& input, Tensor& output,
             if (is_max) result = std::max(result, v);
             else result += v;
 
-            // 递增 reduce 索引
+            // ���� reduce ����
             for (int j = (int)red_axes.size() - 1; j >= 0; j--) {
                 red_idx[j]++;
                 if (red_idx[j] < input.shape[red_axes[j]]) break;
@@ -2258,7 +2455,7 @@ static inline void op_reduce(const Tensor& input, Tensor& output,
 
         output.data[i] = result;
 
-        // 递增输出索引
+        // �����������?
         for (int d = output.ndim - 1; d >= 0; d--) {
             out_idx[d]++;
             if (out_idx[d] < output.shape[d]) break;
@@ -2301,7 +2498,7 @@ static inline void op_softmax(const Tensor& input, Tensor& output, int axis) {
     for (int i = axis + 1; i < input.ndim; i++) inner *= input.shape[i];
     int axis_size = input.shape[axis];
 
-    // 快速路径：inner==1（reduce最后一维），连续内存访问
+    // ����·����inner==1��reduce���һά���������ڴ����
     if (inner == 1) {
         const bool vok = axis_size >= 16;
         const __m256 vones = _mm256_set1_ps(1.0f);
@@ -2309,7 +2506,7 @@ static inline void op_softmax(const Tensor& input, Tensor& output, int axis) {
             const float* src = input.data + (size_t)o * axis_size;
             float* dst = output.data + (size_t)o * axis_size;
             if (vok) {
-                // AVX2：max / 向量化 Schraudolph exp / sum / 归一化
+                // AVX2��max / ������ Schraudolph exp / sum / ��һ��
                 __m256 vmax = _mm256_set1_ps(-1e30f);
                 int a = 0;
                 for (; a + 8 <= axis_size; a += 8)
@@ -2317,11 +2514,11 @@ static inline void op_softmax(const Tensor& input, Tensor& output, int axis) {
                 float max_val = hmax256_ps(vmax);
                 for (; a < axis_size; a++) max_val = std::max(max_val, src[a]);
                 __m256 vsum = _mm256_setzero_ps();
-                const __m256 vlo88 = _mm256_set1_ps(-88.0f), vhi88 = _mm256_set1_ps(88.0f);
+                const __m256 vlo86 = _mm256_set1_ps(-86.0f), vhi86 = _mm256_set1_ps(86.0f);
                 const __m256 vscale = _mm256_set1_ps(12102203.0f), vbias = _mm256_set1_ps(1064866805.0f);
                 for (a = 0; a + 8 <= axis_size; a += 8) {
                     __m256 t = _mm256_sub_ps(_mm256_loadu_ps(src + a), _mm256_set1_ps(max_val));
-                    t = _mm256_min_ps(_mm256_max_ps(t, vlo88), vhi88);
+                    t = _mm256_min_ps(_mm256_max_ps(t, vlo86), vhi86);
                     t = _mm256_fmadd_ps(t, vscale, vbias);
                     __m256 e = _mm256_castsi256_ps(_mm256_cvttps_epi32(t));
                     _mm256_storeu_ps(dst + a, e);
@@ -2334,19 +2531,19 @@ static inline void op_softmax(const Tensor& input, Tensor& output, int axis) {
                     _mm256_storeu_ps(dst + a, _mm256_mul_ps(_mm256_loadu_ps(dst + a), vinv));
                 for (; a < axis_size; a++) dst[a] *= 1.0f / sum;
             } else {
-                // 找最大值
+                // ������?
                 float max_val = src[0];
                 for (int a = 1; a < axis_size; a++) {
                     if (src[a] > max_val) max_val = src[a];
                 }
-                // 计算 exp 和 sum
+                // ���� exp �� sum
                 float sum = 0;
                 for (int a = 0; a < axis_size; a++) {
                     float v = fast_exp(src[a] - max_val);
                     dst[a] = v;
                     sum += v;
                 }
-                // 归一化
+                // ��һ��
                 float inv_sum = 1.0f / sum;
                 for (int a = 0; a < axis_size; a++) {
                     dst[a] *= inv_sum;
@@ -2358,13 +2555,13 @@ static inline void op_softmax(const Tensor& input, Tensor& output, int axis) {
 
     for (int o = 0; o < outer; o++) {
         for (int i = 0; i < inner; i++) {
-            // 找最大值
+            // ������?
             float max_val = -1e30f;
             for (int a = 0; a < axis_size; a++) {
                 int idx = ((o * axis_size + a) * inner) + i;
                 max_val = std::max(max_val, input.data[idx]);
             }
-            // 计算 exp 和 sum
+            // ���� exp �� sum
             float sum = 0;
             for (int a = 0; a < axis_size; a++) {
                 int idx = ((o * axis_size + a) * inner) + i;
@@ -2372,7 +2569,7 @@ static inline void op_softmax(const Tensor& input, Tensor& output, int axis) {
                 output.data[idx] = v;
                 sum += v;
             }
-            // 归一化
+            // ��һ��
             float inv_sum = 1.0f / sum;
             for (int a = 0; a < axis_size; a++) {
                 int idx = ((o * axis_size + a) * inner) + i;
@@ -2418,7 +2615,7 @@ static inline void op_maxpool(const Tensor& input, Tensor& output,
 // Unsqueeze
 // ============================================================
 static inline void op_unsqueeze(const Tensor& input, Tensor& output, const std::vector<int>& axes) {
-    // 计算输出形状
+    // ����������?
     std::vector<int> out_shape;
     int in_idx = 0;
     int total_dims = input.ndim + (int)axes.size();
@@ -2458,7 +2655,7 @@ static inline void op_tile(const Tensor& input, Tensor& output, const std::vecto
     }
     output.alloc(out_shape);
 
-    // 计算输入和输出步长
+    // ����������������
     std::vector<int> in_strides(input.ndim), out_strides(input.ndim);
     int in_s = 1, out_s = 1;
     for (int i = input.ndim - 1; i >= 0; i--) {
@@ -2466,7 +2663,7 @@ static inline void op_tile(const Tensor& input, Tensor& output, const std::vecto
         out_strides[i] = out_s; out_s *= out_shape[i];
     }
 
-    // 逐元素复制
+    // ��Ԫ�ظ���
     for (int i = 0; i < output.numel; i++) {
         int in_offset = 0;
         int rem = i;
@@ -2487,14 +2684,14 @@ static inline void op_gather(const Tensor& input, Tensor& output, const Tensor& 
     if (axis < 0) axis += input.ndim;
     int num_indices = indices.numel;
 
-    // 计算输出形状
+    // ����������?
     std::vector<int> out_shape;
     for (int i = 0; i < axis; i++) out_shape.push_back(input.shape[i]);
     for (int i = 0; i < indices.ndim; i++) out_shape.push_back(indices.shape[i]);
     for (int i = axis + 1; i < input.ndim; i++) out_shape.push_back(input.shape[i]);
     output.alloc(out_shape);
 
-    // 计算步长
+    // ���㲽��
     int outer = 1, inner = 1;
     for (int i = 0; i < axis; i++) outer *= input.shape[i];
     for (int i = axis + 1; i < input.ndim; i++) inner *= input.shape[i];
@@ -2525,21 +2722,21 @@ static inline void op_gather_elements(const Tensor& input, Tensor& output, const
     if (axis < 0) axis += input.ndim;
     output.alloc(indices.shape);
 
-    // 计算步长
+    // ���㲽��
     std::vector<int> in_strides(input.ndim), out_strides(indices.ndim);
     int in_s = 1, out_s = 1;
     for (int i = input.ndim - 1; i >= 0; i--) { in_strides[i] = in_s; in_s *= input.shape[i]; }
     for (int i = indices.ndim - 1; i >= 0; i--) { out_strides[i] = out_s; out_s *= indices.shape[i]; }
 
     for (int i = 0; i < output.numel; i++) {
-        // 解码输出索引
+        // �����������?
         std::vector<int> out_idx(indices.ndim);
         int rem = i;
         for (int d = 0; d < indices.ndim; d++) {
             out_idx[d] = rem / out_strides[d];
             rem %= out_strides[d];
         }
-        // 计算输入偏移（axis维度用indices的值）
+        // ��������ƫ�ƣ�axisά����indices��ֵ��
         int in_offset = 0;
         for (int d = 0; d < input.ndim; d++) {
             int idx;
@@ -2570,32 +2767,32 @@ static inline void op_topk(const Tensor& input, Tensor& output_values, Tensor& o
     int axis_size = input.shape[axis];
     if (k > axis_size) k = axis_size;
 
-    // 输出形状
+    // ������?
     std::vector<int> out_shape = input.shape;
     out_shape[axis] = k;
     output_values.alloc(out_shape);
     output_indices.alloc(out_shape);
 
-    // 计算步长
+    // ���㲽��
     int outer = 1, inner = 1;
     for (int i = 0; i < axis; i++) outer *= input.shape[i];
     for (int i = axis + 1; i < input.ndim; i++) inner *= input.shape[i];
 
     for (int o = 0; o < outer; o++) {
         for (int inn = 0; inn < inner; inn++) {
-            // 收集axis维度的所有值
+            // �ռ�axisά�ȵ�����ֵ
             std::vector<std::pair<float, int>> vec(axis_size);
             for (int a = 0; a < axis_size; a++) {
                 int offset = (o * axis_size + a) * inner + inn;
                 vec[a] = {input.data[offset], a};
             }
-            // 排序
+            // ����
             if (largest) {
                 std::sort(vec.begin(), vec.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             } else {
                 std::sort(vec.begin(), vec.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
             }
-            // 取前k个
+            // ȡǰk��
             for (int i = 0; i < k; i++) {
                 int out_offset = (o * k + i) * inner + inn;
                 output_values.data[out_offset] = vec[i].first;
@@ -2624,7 +2821,7 @@ static inline void op_mod(const Tensor& a, const Tensor& b, Tensor& output) {
         return;
     }
 
-    // 通用广播
+    // ͨ�ù㲥
     for (int i = 0; i < output.numel; i++) {
         float va = read_tensor_val(a, broadcast_index(i, out_shape, a.shape));
         float vb = read_tensor_val(b, broadcast_index(i, out_shape, b.shape));
@@ -2633,7 +2830,7 @@ static inline void op_mod(const Tensor& a, const Tensor& b, Tensor& output) {
 }
 
 // ============================================================
-// Cast (目前只支持float，直接复制)
+// Cast (Ŀǰֻ֧��float��ֱ�Ӹ���)
 // ============================================================
 static inline void op_cast(const Tensor& input, Tensor& output) {
     output.alloc(input.shape);
