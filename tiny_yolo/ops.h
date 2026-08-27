@@ -1,4 +1,4 @@
-// Tiny YOLO - ����ʵ��
+﻿// Tiny YOLO - ����ʵ��
 // ȫ�� inline����С���?
 #pragma once
 #include "tensor.h"
@@ -652,6 +652,83 @@ static inline void gemm_nm_packed_core(const float* X, const float* Wp, const fl
     }
 }
 
+// 4-lane W packing for N%4==0 (256/512/1024 ch 1x1 convs; the 6-lane path
+// only fires when N%6==0 so most YOLO 1x1 heads never got the packed GEMM).
+struct PackedW4 { std::vector<float> data; int N = 0, K = 0; };
+static std::unordered_map<const void*, PackedW4> g_packedW4;
+static std::mutex g_packedW4_mtx;
+static const float* get_packed_W4(const float* W, int N, int K) {
+    if (N % 4 != 0 || K < 32) return nullptr;
+    std::lock_guard<std::mutex> lk(g_packedW4_mtx);
+    auto it = g_packedW4.find(W);
+    if (it != g_packedW4.end() && it->second.N == N && it->second.K == K) return it->second.data.data();
+    PackedW4 pw; pw.N = N; pw.K = K;
+    pw.data.resize((size_t)K * N);
+    int nb = N / 4;
+    for (int k = 0; k < K; k++)
+        for (int b = 0; b < nb; b++)
+            for (int i = 0; i < 4; i++)
+                pw.data[(size_t)k * N + b * 4 + i] = W[(b * 4 + i) * K + k];
+    g_packedW4[W] = std::move(pw);
+    return g_packedW4[W].data.data();
+}
+
+static inline void clear_packed_W4_cache() {
+    std::lock_guard<std::mutex> lk(g_packedW4_mtx);
+    g_packedW4.clear();
+}
+
+static inline void gemm_nm_packed4_core(const float* X, const float* Wp, const float* bias,
+                                         float* Out, int N, int M, int K, bool silu,
+                                         int m0, int m1) {
+    int nb = N / 4;
+    const __m256 vones = _mm256_set1_ps(1.0f);
+    for (int b = 0; b < nb; b++) {
+        float* o0 = Out + (size_t)(b * 4) * M;
+        int m = m0;
+        for (; m + 7 < m1; m += 8) {
+            __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+            const float* xk = X + m;
+            const float* wpk = Wp + b * 4;
+            for (int k = 0; k < K; k++, xk += M, wpk += N) {
+                __m256 xv = _mm256_loadu_ps(xk);
+                acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(wpk + 0), xv, acc0);
+                acc1 = _mm256_fmadd_ps(_mm256_broadcast_ss(wpk + 1), xv, acc1);
+                acc2 = _mm256_fmadd_ps(_mm256_broadcast_ss(wpk + 2), xv, acc2);
+                acc3 = _mm256_fmadd_ps(_mm256_broadcast_ss(wpk + 3), xv, acc3);
+            }
+            __m256 vs[4] = {acc0, acc1, acc2, acc3};
+            for (int i = 0; i < 4; i++) {
+                __m256 v = vs[i];
+                if (bias) v = _mm256_add_ps(v, _mm256_set1_ps(bias[b * 4 + i]));
+                if (silu) {
+                    __m256 t = _mm256_sub_ps(_mm256_setzero_ps(), v);
+                    t = _mm256_min_ps(t, _mm256_set1_ps(86.0f));
+                    t = _mm256_max_ps(t, _mm256_set1_ps(-86.0f));
+                    t = _mm256_fmadd_ps(t, _mm256_set1_ps(12102203.0f), _mm256_set1_ps(1064866805.0f));
+                    __m256 ex = _mm256_castsi256_ps(_mm256_cvttps_epi32(t));
+                    v = _mm256_div_ps(v, _mm256_add_ps(vones, ex));
+                }
+                _mm256_storeu_ps(o0 + (size_t)i * M + m, v);
+            }
+        }
+        for (; m < m1; m++) {
+            float s[4] = {0, 0, 0, 0};
+            for (int k = 0; k < K; k++) {
+                float xv = X[(size_t)k * M + m];
+                const float* wpk = Wp + (size_t)k * N + b * 4;
+                for (int i = 0; i < 4; i++) s[i] += wpk[i] * xv;
+            }
+            for (int i = 0; i < 4; i++) {
+                float v = s[i] + (bias ? bias[b * 4 + i] : 0.0f);
+                if (silu) v = v / (1.0f + fast_exp(-v));
+                o0[(size_t)i * M + m] = v;
+            }
+        }
+    }
+}
+
 static inline void gemm_nm(const float* X, const float* W, const float* bias,
                             float* Out, int N, int M, int K, bool silu = false) {
     long long macs = (long long)N * M * K;
@@ -661,16 +738,19 @@ static inline void gemm_nm(const float* X, const float* W, const float* bias,
         return;
     }
 
-    // ���� W ���·������?K �� N Ϊ 6 ����ʱ���У�
+    // pick packed lanes: 6 if N%6==0, else 4 if N%4==0 (covers 64/128/256/512/1024)
+    int lanes = 0; // default keep legacy path (esp. x86, where 4-lane pack regressed ~4x)
+#if defined(_WIN64) && defined(__AVX2__)
+    lanes = (N % 6 == 0) ? 6 : ((N % 4 == 0) ? 4 : 0);
+#endif
     const float* Wp = nullptr;
-    if (N % 6 == 0 && K >= 32) Wp = get_packed_W(W, N, K);
+    if (lanes == 6 && K >= 32) Wp = get_packed_W(W, N, K);
+    else if (lanes == 4 && K >= 32) Wp = get_packed_W4(W, N, K);
 
     size_t xbytes = (size_t)K * M * sizeof(float);
-    int CH = 6;
+    int CH = lanes ? lanes : 6;
     if (!Wp && xbytes <= (2u << 20)) {
         while (CH > 1 && (N + CH - 1) / CH < workers * 2) CH--;
-    } else if (Wp) {
-        CH = 6; // ���·���̶�?6 ͨ����
     }
     int nb = (N + CH - 1) / CH;
     int mb = 1;
@@ -680,11 +760,14 @@ static inline void gemm_nm(const float* X, const float* W, const float* bias,
     int tasks = nb * m_blocks;
     if (tasks <= 1) {
         if (Wp) {
-            // ���·����?6 ͨ�����з�ʱ��������
             for (int b = 0; b < nb; b++) {
-                int n0 = b * 6, n1 = std::min(N, n0 + 6);
-                if (n1 - n0 == 6) gemm_nm_packed_core(X, Wp, bias ? bias + n0 : nullptr, Out, N, M, K, silu, 0, M);
-                else gemm_nm_core(X, W + (size_t)n0 * K, bias ? bias + n0 : nullptr, Out + (size_t)n0 * M, n1 - n0, M, K, silu, 0, M);
+                int n0 = b * lanes, n1 = std::min(N, n0 + lanes);
+                if (n1 - n0 == lanes) {
+                    if (lanes == 4) gemm_nm_packed4_core(X, Wp, bias ? bias + n0 : nullptr, Out, N, M, K, silu, 0, M);
+                    else gemm_nm_packed_core(X, Wp, bias ? bias + n0 : nullptr, Out, N, M, K, silu, 0, M);
+                } else {
+                    gemm_nm_core(X, W + (size_t)n0 * K, bias ? bias + n0 : nullptr, Out + (size_t)n0 * M, n1 - n0, M, K, silu, 0, M);
+                }
             }
         } else {
             gemm_nm_core(X, W, bias, Out, N, M, K, silu);
@@ -693,11 +776,11 @@ static inline void gemm_nm(const float* X, const float* W, const float* bias,
     }
 
     if (Wp) {
-        // ���·��ʵ�ʲ���?M �����У�ͨ���������� core ����������
         SimpleThreadPool::instance().parallel_for(m_blocks, [&](int mk) {
             int ma = mk * m_chunk;
             int mz = std::min(M, ma + m_chunk);
-            gemm_nm_packed_core(X, Wp, bias, Out, N, M, K, silu, ma, mz);
+            if (lanes == 4) gemm_nm_packed4_core(X, Wp, bias, Out, N, M, K, silu, ma, mz);
+            else           gemm_nm_packed_core(X, Wp, bias, Out, N, M, K, silu, ma, mz);
         });
         return;
     }
@@ -1019,10 +1102,113 @@ static inline double now_ms_() {
 }
 // ģ�����?TS = tile ����߳���? => F(2,3)��4 => F(4,3)����
 // ��֤ D/KT �Ǳ����ڳ�������ѭ��������չ��
+// ---------------------------------------------------------------------------
+// SIMD batched F(4,3) transforms: 8 tiles per AVX2 lane-group.
+// Input : V = BT*D*BT^T (6x6 window -> 6x6), loads via AVX2 gather from the
+//         padded plane; stores into the existing [T][KT] scratch (strided).
+// Output: Y = AT*M*AT^T (6x6 -> 4x4), Mbuf rows continuous per k -> loadu.
+// Both transforms reuse one coefficient helper per stage.
+// ---------------------------------------------------------------------------
+
+// o[i] = BT[i] dot x  (BT = [[4,0,-5,0,1,0],[0,-4,-4,1,1,0],[0,4,-4,-1,1,0],
+//                             [0,-2,-1,2,1,0],[0,2,-1,-2,1,0],[0,4,0,-5,0,1]])
+static inline void f4_bt6_row(const __m256 x[6], __m256 o[6]) {
+    o[0] = _mm256_fmadd_ps(_mm256_set1_ps(4.0f), x[0], _mm256_fmadd_ps(_mm256_set1_ps(-5.0f), x[2], x[4]));
+    o[1] = _mm256_fmadd_ps(_mm256_set1_ps(-4.0f), x[1], _mm256_fmadd_ps(_mm256_set1_ps(-4.0f), x[2], _mm256_add_ps(x[3], x[4])));
+    o[2] = _mm256_fmadd_ps(_mm256_set1_ps(4.0f), x[1], _mm256_fmadd_ps(_mm256_set1_ps(-4.0f), x[2], _mm256_sub_ps(x[4], x[3])));
+    o[3] = _mm256_fmadd_ps(_mm256_set1_ps(-2.0f), x[1], _mm256_fmadd_ps(_mm256_set1_ps(-1.0f), x[2], _mm256_fmadd_ps(_mm256_set1_ps(2.0f), x[3], x[4])));
+    o[4] = _mm256_fmadd_ps(_mm256_set1_ps(2.0f), x[1], _mm256_fmadd_ps(_mm256_set1_ps(-1.0f), x[2], _mm256_fmadd_ps(_mm256_set1_ps(-2.0f), x[3], x[4])));
+    o[5] = _mm256_fmadd_ps(_mm256_set1_ps(4.0f), x[1], _mm256_fmadd_ps(_mm256_set1_ps(-5.0f), x[3], x[5]));
+}
+
+// o[r] = AT[r] dot x  (AT = [[1,1,1,1,1,0],[0,1,-1,2,-2,0],[0,1,1,4,4,0],[0,1,-1,8,-8,1]])
+static inline void f4_at4_row(const __m256 x[6], __m256 o[4]) {
+    o[0] = _mm256_add_ps(_mm256_add_ps(x[0], x[1]), _mm256_add_ps(_mm256_add_ps(x[2], x[3]), x[4]));
+    o[1] = _mm256_fmadd_ps(_mm256_set1_ps(2.0f), x[3], _mm256_fmadd_ps(_mm256_set1_ps(-2.0f), x[4], _mm256_sub_ps(x[1], x[2])));
+    o[2] = _mm256_fmadd_ps(_mm256_set1_ps(4.0f), x[3], _mm256_fmadd_ps(_mm256_set1_ps(4.0f), x[4], _mm256_add_ps(x[1], x[2])));
+    o[3] = _mm256_fmadd_ps(_mm256_set1_ps(8.0f), x[3], _mm256_fmadd_ps(_mm256_set1_ps(-8.0f), x[4], _mm256_fmadd_ps(_mm256_set1_ps(1.0f), x[5], _mm256_sub_ps(x[1], x[2]))));
+}
+
+// input transform for 8 consecutive tiles t0..t0+7; dst is the [T][KT] scratch.
+static inline void wino43_input_transform8(const float* padded, float* dst,
+                                           int T, int w_tiles, int pW, int t0) {
+    __m256i idx;
+    {
+        int off[8];
+        for (int i = 0; i < 8; i++) {
+            int tt = t0 + i;
+            int ht = tt / w_tiles, wt = tt % w_tiles;
+            off[i] = (ht * 4) * pW + wt * 4; // element offsets from channel base
+        }
+        idx = _mm256_setr_epi32(off[0], off[1], off[2], off[3], off[4], off[5], off[6], off[7]);
+    }
+    __m256 d[6][6], tmp[6][6], v[6][6];
+    for (int j = 0; j < 6; j++)
+        for (int c = 0; c < 6; c++)
+            d[j][c] = _mm256_i32gather_ps(padded + j * pW + c, idx, 4);
+    // tmp[i][c] = BT[i] dot d[.][c]
+    for (int c = 0; c < 6; c++) {
+        __m256 x[6], o[6];
+        for (int j = 0; j < 6; j++) x[j] = d[j][c];
+        f4_bt6_row(x, o);
+        for (int i = 0; i < 6; i++) tmp[i][c] = o[i];
+    }
+    // v[i][s] = BT[s] dot tmp[i][.]
+    for (int i = 0; i < 6; i++) f4_bt6_row(tmp[i], v[i]);
+    float tv[8];
+    for (int kk = 0; kk < 36; kk++) {
+        _mm256_storeu_ps(tv, v[kk / 6][kk % 6]);
+        for (int i = 0; i < 8; i++) dst[(size_t)(t0 + i) * 36 + kk] = tv[i];
+    }
+}
+
+// output transform for 8 consecutive tiles t0..t0+7 (bias + fused SiLU folded in).
+static inline void wino43_output_transform8(const float* Mbuf, float* out_n, const float* bias, bool silu,
+                                            int C_out, int p, int T, int w_tiles, int outH, int outW, int t0) {
+    __m256 m[36], tmp[4][6], y[4][4];
+    for (int k = 0; k < 36; k++)
+        m[k] = _mm256_loadu_ps(Mbuf + ((size_t)k * C_out + p) * T + t0);
+    for (int c = 0; c < 6; c++) {
+        __m256 x[6], o[4];
+        for (int j = 0; j < 6; j++) x[j] = m[j * 6 + c];
+        f4_at4_row(x, o);
+        for (int r = 0; r < 4; r++) tmp[r][c] = o[r];
+    }
+    for (int r = 0; r < 4; r++) f4_at4_row(tmp[r], y[r]);
+    const __m256 vb = _mm256_set1_ps(bias ? bias[p] : 0.0f);
+    for (int r = 0; r < 4; r++)
+        for (int s = 0; s < 4; s++) {
+            __m256 vv = _mm256_add_ps(y[r][s], vb);
+            if (silu) {
+                __m256 tv = _mm256_sub_ps(_mm256_setzero_ps(), vv);
+                tv = _mm256_min_ps(tv, _mm256_set1_ps(86.0f));
+                tv = _mm256_max_ps(tv, _mm256_set1_ps(-86.0f));
+                tv = _mm256_fmadd_ps(tv, _mm256_set1_ps(12102203.0f), _mm256_set1_ps(1064866805.0f));
+                __m256 ex = _mm256_castsi256_ps(_mm256_cvttps_epi32(tv));
+                vv = _mm256_div_ps(vv, _mm256_add_ps(_mm256_set1_ps(1.0f), ex));
+            }
+            y[r][s] = vv;
+        }
+    float yv[4][4][8];
+    for (int r = 0; r < 4; r++)
+        for (int s = 0; s < 4; s++)
+            _mm256_storeu_ps(yv[r][s], y[r][s]);
+    for (int i = 0; i < 8; i++) {
+        int tt = t0 + i;
+        int ht = tt / w_tiles, wt = tt % w_tiles;
+        int oh = ht * 4, ow = wt * 4;
+        float* op = out_n + (size_t)p * outH * outW;
+        for (int r = 0; r < 4 && oh + r < outH; r++)
+            for (int s = 0; s < 4 && ow + s < outW; s++)
+                op[(size_t)(oh + r) * outW + (ow + s)] = yv[r][s][i];
+    }
+}
+
 template<int TS>
 static inline void conv3x3s1_wino_tmpl(const float* input, const float* weight, const float* bias,
                                         float* output, bool apply_silu,
                                         int N, int C_in, int H, int W, int C_out) {
+    static const bool g_no_simd = (getenv("TINY_YOLO_NO_SIMD") != nullptr); // A/B: disable F4 SIMD transforms
     constexpr int D  = TS + 2;   // ���봰�ڱ߳����� kernel ���ǣ�
     constexpr int KT = D * D;    // k �ռ��С��F(2,3)=16��F(4,3)=36��
 
@@ -1043,7 +1229,10 @@ static inline void conv3x3s1_wino_tmpl(const float* input, const float* weight, 
     // �м仺������С��U ֱ�����û��棬���ٿ��빤������
     size_t V_size = (size_t)KT * C_in * T;
     size_t M_size = (size_t)KT * C_out * T;
-    size_t total = pad_numel + pW + V_size + M_size;
+    // dense transform scratch only when per-conv size is small; for 640-class
+    // maps a full C_in*KT*T scratch would be tens of MB and hurt cache
+    const bool vt_scratch = ((size_t)C_in * (size_t)KT * (size_t)T) <= ((size_t)2 << 20);
+    size_t total = pad_numel + pW + V_size + M_size + (vt_scratch ? (size_t)C_in * (size_t)KT * (size_t)T : 0);
     float* ws = get_temp_buf(total);
     float* padded = ws;
     float* V = ws + pad_numel + pW;
@@ -1105,16 +1294,19 @@ static inline void conv3x3s1_wino_tmpl(const float* input, const float* weight, 
                 for (int c = 0; c < C_in; c++) pad_body(c);
             }
         }
-        if ((long long)C_in * T > 8192 && C_in >= 2) {
-            const int QC = 4;
-            int qblocks = (C_in + QC - 1) / QC;
-            SimpleThreadPool::instance().parallel_for(qblocks, [&](int qb) {
-                int q_begin = qb * QC;
-                int q_end = std::min(C_in, q_begin + QC);
-                for (int q = q_begin; q < q_end; q++) {
-                    const float* img_q = padded + (size_t)q * pH * pW;
-                    float* v_q = V + (size_t)q * T;
-                    for (int t = 0; t < T; t++) {
+        // One channel may be processed by either path: dense scratch makes the
+        // k-plane stores contiguous (better for small 256-class maps), while the
+        // direct path keeps memory flat for large 640-class maps.
+        auto vt_channel = [&](int q) {
+            const float* img_q = padded + (size_t)q * pH * pW;
+            if (vt_scratch) {
+                float* scr = ws + pad_numel + pW + V_size + M_size + (size_t)q * (size_t)KT * T;
+                if (TS == 4 && T >= 8 && !g_no_simd) {
+                    // SIMD: F(4,3) gathers 8 tiles per batch
+                    int t = 0;
+                    for (; t + 8 <= T; t += 8) wino43_input_transform8(img_q, scr, T, w_tiles, pW, t);
+                    for (; t < T; t++) {
+                        float v[36];
                         int ht = t / w_tiles;
                         int wt = t % w_tiles;
                         int oh = ht * TS, ow = wt * TS;
@@ -1122,19 +1314,12 @@ static inline void conv3x3s1_wino_tmpl(const float* input, const float* weight, 
                         float d_block[36];
                         for (int r = 0; r < D; r++)
                             memcpy(d_block + r * D, d_src + r * pW, D * sizeof(float));
-                        float v[36];
-                        if (TS == 4) wino43_input_transform(d_block, v);
-                        else         winograd_input_transform(d_block, v);
-                        float* dst = v_q;
-                        for (int k = 0; k < KT; k++, dst += (size_t)C_in * T) dst[t] = v[k];
+                        wino43_input_transform(d_block, v);
+                        for (int kk = 0; kk < KT; kk++) scr[(size_t)t * KT + kk] = v[kk];
                     }
-                }
-            });
-        } else {
-            for (int q = 0; q < C_in; q++) {
-                const float* img_q = padded + (size_t)q * pH * pW;
-                float* v_q = V + (size_t)q * T;
+                } else {
                 for (int t = 0; t < T; t++) {
+                    float v[36];
                     int ht = t / w_tiles;
                     int wt = t % w_tiles;
                     int oh = ht * TS, ow = wt * TS;
@@ -1142,13 +1327,44 @@ static inline void conv3x3s1_wino_tmpl(const float* input, const float* weight, 
                     float d_block[36];
                     for (int r = 0; r < D; r++)
                         memcpy(d_block + r * D, d_src + r * pW, D * sizeof(float));
+                    if (TS == 4) wino43_input_transform(d_block, v);
+                    else         winograd_input_transform(d_block, v);
+                    for (int kk = 0; kk < KT; kk++) scr[(size_t)t * KT + kk] = v[kk];
+                }
+                }
+                float* v_q = V + (size_t)q * T;
+                for (int k = 0; k < KT; k++) {
+                    float* plane = v_q + (size_t)k * (size_t)C_in * T;
+                    for (int t = 0; t < T; t++) plane[t] = scr[(size_t)t * KT + k];
+                }
+            } else {
+                float* v_q = V + (size_t)q * T;
+                for (int t = 0; t < T; t++) {
                     float v[36];
+                    int ht = t / w_tiles;
+                    int wt = t % w_tiles;
+                    int oh = ht * TS, ow = wt * TS;
+                    const float* d_src = img_q + oh * pW + ow;
+                    float d_block[36];
+                    for (int r = 0; r < D; r++)
+                        memcpy(d_block + r * D, d_src + r * pW, D * sizeof(float));
                     if (TS == 4) wino43_input_transform(d_block, v);
                     else         winograd_input_transform(d_block, v);
                     float* dst = v_q;
                     for (int k = 0; k < KT; k++, dst += (size_t)C_in * T) dst[t] = v[k];
                 }
             }
+        };
+        if ((long long)C_in * T > 8192 && C_in >= 2) {
+            const int QC = 4;
+            int qblocks = (C_in + QC - 1) / QC;
+            SimpleThreadPool::instance().parallel_for(qblocks, [&](int qb) {
+                int q_begin = qb * QC;
+                int q_end = std::min(C_in, q_begin + QC);
+                for (int q = q_begin; q < q_end; q++) vt_channel(q);
+            });
+        } else {
+            for (int q = 0; q < C_in; q++) vt_channel(q);
         }
 
         // 4. KT ��С GEMM��M[k] = U[k] �� V[k]���� k ���У��ڲ����б���Ƕ�ײ��У�
@@ -1176,33 +1392,38 @@ static inline void conv3x3s1_wino_tmpl(const float* input, const float* weight, 
         const int PC = 8;
         int pblocks = (C_out + PC - 1) / PC;
         bool out_mt = ((long long)C_out * T > 8192 && pool.num_threads() > 1);
+        // scalar transform for one (p, t); shared by SIMD tail and TS=2 path
+        auto ot_tile = [&](int p, int t) {
+            float m[36], y[16];
+            int ht = t / w_tiles;
+            int wt = t % w_tiles;
+            int oh = ht * TS, ow = wt * TS;
+            for (int k = 0; k < KT; k++) m[k] = Mbuf[((size_t)k * C_out + p) * T + t];
+            if (TS == 4) wino43_output_transform(m, y);
+            else         winograd_output_transform(m, y);
+            float b = bias ? bias[p] : 0.0f;
+            for (int i = 0; i < TS * TS; i++) {
+                float val = y[i] + b;
+                if (apply_silu) val = val / (1.0f + fast_exp(-val));
+                y[i] = val;
+            }
+            float* out_p = out_n + (size_t)p * outH * outW;
+            for (int dh = 0; dh < TS && oh + dh < outH; dh++)
+                for (int dw = 0; dw < TS && ow + dw < outW; dw++)
+                    out_p[(oh + dh) * outW + (ow + dw)] = y[dh * TS + dw];
+        };
         auto out_body = [&](int pb) {
             int p_begin = pb * PC;
             int p_end = std::min(C_out, p_begin + PC);
-            for (int t = 0; t < T; t++) {
-                int ht = t / w_tiles;
-                int wt = t % w_tiles;
-                int oh = ht * TS, ow = wt * TS;
+            if (TS == 4 && T >= 8 && !g_no_simd) {
                 for (int p = p_begin; p < p_end; p++) {
-                    float m[36], y[16];
-                    for (int k = 0; k < KT; k++) {
-                        m[k] = Mbuf[((size_t)k * C_out + p) * T + t];
-                    }
-                    if (TS == 4) wino43_output_transform(m, y);
-                    else         winograd_output_transform(m, y);
-                    float b = bias ? bias[p] : 0.0f;
-                    for (int i = 0; i < TS * TS; i++) {
-                        float val = y[i] + b;
-                        if (apply_silu) val = val / (1.0f + fast_exp(-val));
-                        y[i] = val;
-                    }
-                    float* out_p = out_n + (size_t)p * outH * outW;
-                    for (int dh = 0; dh < TS && oh + dh < outH; dh++) {
-                        for (int dw = 0; dw < TS && ow + dw < outW; dw++) {
-                            out_p[(oh + dh) * outW + (ow + dw)] = y[dh * TS + dw];
-                        }
-                    }
+                    int t = 0;
+                    for (; t + 8 <= T; t += 8) wino43_output_transform8(Mbuf, out_n, bias, apply_silu, C_out, p, T, w_tiles, outH, outW, t);
+                    for (; t < T; t++) ot_tile(p, t);
                 }
+            } else {
+                for (int t = 0; t < T; t++)
+                    for (int p = p_begin; p < p_end; p++) ot_tile(p, t);
             }
         };
         if (out_mt && pblocks >= 2) {
@@ -1440,6 +1661,84 @@ static inline void im2col_km(const float* input, float* output,
 // ============================================================
 // Conv
 // ============================================================
+
+// Fast depthwise 3x3 s1 p1 convolution (group == C_in == C_out, 1 ch/group).
+// C2PSA attention depthwise convs previously fell into the generic group
+// path: sequential over ALL channels with an im2col+gemm per channel
+// (~18ms/frame on v11m256). Here: pad per channel + AVX2 across 8 columns,
+// channels parallelized via the thread pool.
+static inline void depthwise3x3s1(const float* input, const float* weight, const float* bias,
+                                  float* output, bool silu, int C, int H, int W) {
+    const int rows = H * W;
+    const int pH = H + 2, pW = W + 2;
+    float* pad = get_temp_buf((size_t)C * pH * pW + 8);
+    SimpleThreadPool& pool = SimpleThreadPool::instance();
+    int workers = pool.num_threads();
+    bool mt = workers > 1 && (size_t)C * rows > (size_t)4096;
+
+    auto body = [&](int c0, int c1) {
+        for (int c = c0; c < c1; c++) {
+            const float* in_c = input + (size_t)c * rows;
+            float* pad_c = pad + (size_t)c * pH * pW;
+            const float* wp = weight + (size_t)c * 9;
+            float* out_c = output + (size_t)c * rows;
+            memset(pad_c, 0, sizeof(float) * pH * pW);
+            for (int y = 0; y < H; y++)
+                memcpy(pad_c + (size_t)(y + 1) * pW + 1, in_c + (size_t)y * W, sizeof(float) * W);
+            const float b = bias ? bias[c] : 0.0f;
+            const float w00 = wp[0], w01 = wp[1], w02 = wp[2];
+            const float w10 = wp[3], w11 = wp[4], w12 = wp[5];
+            const float w20 = wp[6], w21 = wp[7], w22 = wp[8];
+            const __m256 vb = _mm256_set1_ps(b);
+            const __m256 vw00 = _mm256_set1_ps(w00), vw01 = _mm256_set1_ps(w01), vw02 = _mm256_set1_ps(w02);
+            const __m256 vw10 = _mm256_set1_ps(w10), vw11 = _mm256_set1_ps(w11), vw12 = _mm256_set1_ps(w12);
+            const __m256 vw20 = _mm256_set1_ps(w20), vw21 = _mm256_set1_ps(w21), vw22 = _mm256_set1_ps(w22);
+            for (int y = 0; y < H; y++) {
+                const float* r0 = pad_c + (size_t)y * pW;
+                const float* r1 = r0 + pW;
+                const float* r2 = r1 + pW;
+                float* o = out_c + (size_t)y * W;
+                int x = 0;
+                for (; x + 8 <= W; x += 8) {
+                    __m256 acc = vb;
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + x), vw00, acc);
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + x + 1), vw01, acc);
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + x + 2), vw02, acc);
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + x), vw10, acc);
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + x + 1), vw11, acc);
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + x + 2), vw12, acc);
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + x), vw20, acc);
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + x + 1), vw21, acc);
+                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + x + 2), vw22, acc);
+                    if (silu) {
+                        __m256 t = _mm256_sub_ps(_mm256_setzero_ps(), acc);
+                        t = _mm256_min_ps(t, _mm256_set1_ps(86.0f));
+                        t = _mm256_max_ps(t, _mm256_set1_ps(-86.0f));
+                        t = _mm256_fmadd_ps(t, _mm256_set1_ps(12102203.0f), _mm256_set1_ps(1064866805.0f));
+                        __m256 ex = _mm256_castsi256_ps(_mm256_cvttps_epi32(t));
+                        acc = _mm256_div_ps(acc, _mm256_add_ps(_mm256_set1_ps(1.0f), ex));
+                    }
+                    _mm256_storeu_ps(o + x, acc);
+                }
+                for (; x < W; x++) {
+                    float v = b + r0[x] * w00 + r0[x + 1] * w01 + r0[x + 2] * w02
+                                 + r1[x] * w10 + r1[x + 1] * w11 + r1[x + 2] * w12
+                                 + r2[x] * w20 + r2[x + 1] * w21 + r2[x + 2] * w22;
+                    o[x] = silu ? v / (1.0f + fast_exp(-v)) : v;
+                }
+            }
+        }
+    };
+
+    if (mt) {
+        int qc = std::max(1, C / (workers * 2));
+        int qb = (C + qc - 1) / qc;
+        pool.parallel_for(qb, [&](int qi) { body(qi * qc, std::min(C, (qi + 1) * qc)); });
+    } else {
+        body(0, C);
+    }
+}
+
 static inline void op_conv(const Tensor& input, const Tensor& weight, const Tensor* bias,
                            Tensor& output, const ConvAttr& attr, bool apply_silu = false) {
     // 调试开关：TINY_YOLO_NO_SILU=1 时禁用所有融合 SiLU（定位数值问题用）
@@ -1542,6 +1841,17 @@ static inline void op_conv(const Tensor& input, const Tensor& weight, const Tens
         int C_per_group = C_in / group;
         int C_out_per_group = C_out / group;
         int col_size = C_per_group * kH * kW;
+
+        // depthwise fast path: 1 channel per group, 3x3 stride-1
+        // (typical C2PSA attention depthwise convs, e.g. v11m/v26)
+        if (C_per_group == 1 && C_out_per_group == 1 && group == C_in && group == C_out
+            && kH == 3 && kW == 3 && attr.stride_h == 1 && attr.stride_w == 1
+            && attr.pad_h == 1 && attr.pad_w == 1
+            && attr.dilation_h == 1 && attr.dilation_w == 1) {
+            depthwise3x3s1(input.data, weight.data, bias ? bias->data : nullptr,
+                           output.data, apply_silu, C_in, H, W);
+            return;
+        }
         int M = outH * outW;
         size_t col_numel = (size_t)N * M * col_size;
         size_t group_input_numel = (size_t)N * C_per_group * H * W;

@@ -49,7 +49,8 @@ public:
         ops.clear();
         loaded = false;
         clear_winograd_weight_cache(); // 权重内存即将释放，清理 Winograd 权重缓存
-        clear_packed_W_cache();        // 同理清理 1x1 打包权重缓存（防止地址复用导致脏数据）
+        clear_packed_W_cache();        
+        clear_packed_W4_cache();       // also clear 4-lane packed cache        // 同理清理 1x1 打包权重缓存（防止地址复用导致脏数据）
         SimpleThreadPool::instance().shutdown();
     }
 
@@ -466,6 +467,14 @@ public:
         tensors[tid].reference(shape, (float*)data);
         tensors[tid].own_data = false;
         return true;
+    }
+
+    // query the input shape declared in the ONNX header (for auto adopting
+    // the training resolution of fixed-size models)
+    bool get_input_shape(int idx, std::vector<int>& out) const {
+        if (idx < 0 || idx >= (int)input_names.size() || idx >= (int)tensor_infos.size()) return false;
+        out = tensor_infos[idx].shape;
+        return !out.empty();
     }
 
     // 鑾峰彇杈撳嚭寮犻噺鏁版嵁

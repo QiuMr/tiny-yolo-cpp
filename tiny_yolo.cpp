@@ -20,19 +20,39 @@ static TinyModel* g_model = nullptr;
 // 鍙厤缃殑杈撳叆鍒嗚鲸鐜囷紙榛樿640锛屽彲閫氳繃SetInputSize淇敼锛?
 static int g_input_w = 640;
 static int g_input_h = 640;
+// explicit SetInputSize() disables auto-adopting the model declared size
+static bool g_input_size_explicit = false;
+
+// If the user never called SetInputSize, adopt the batch model input HxW
+// declared in the ONNX header. Fixed-shape exports (v11m256: DFL/attn
+// Reshape hardcoded to 256) output garbage when fed the 640 default
+// (observed: ~20 nonsense boxes conf=1.0 vs ORT correct 10).
+static void adopt_model_input_size() {
+    if (g_input_size_explicit || !g_model) return;
+    std::vector<int> shp;
+    if (g_model->get_input_shape(0, shp) && shp.size() >= 4
+        && shp[2] > 1 && shp[3] > 1) {
+        g_input_h = shp[2];
+        g_input_w = shp[3];
+    }
+}
 
 extern "C" __declspec(dllexport) void __stdcall SetInputSize(int w, int h) {
     g_input_w = w;
     g_input_h = h;
+    g_input_size_explicit = true;
 }
 
 struct Box { float x, y, w, h, score; int label; };
 
+// NOTE: Box.x/y are top-left corners (see postprocess). The old center-form
+// (x +/- w/2) was left over and produced translated overlap regions, making
+// NMS diverge from ORT for overlapping boxes. Use corner form here.
 static inline float iou(const Box& a, const Box& b) {
-    float x1 = std::max(a.x - a.w * 0.5f, b.x - b.w * 0.5f);
-    float y1 = std::max(a.y - a.h * 0.5f, b.y - b.h * 0.5f);
-    float x2 = std::min(a.x + a.w * 0.5f, b.x + b.w * 0.5f);
-    float y2 = std::min(a.y + a.h * 0.5f, b.y + b.h * 0.5f);
+    float x1 = std::max(a.x, b.x);
+    float y1 = std::max(a.y, b.y);
+    float x2 = std::min(a.x + a.w, b.x + b.w);
+    float y2 = std::min(a.y + a.h, b.y + b.h);
     if (x2 <= x1 || y2 <= y1) return 0.0f;
     float interArea = (x2 - x1) * (y2 - y1);
     float unionArea = a.w * a.h + b.w * b.h - interArea;
@@ -61,6 +81,7 @@ extern "C" __declspec(dllexport) int __stdcall InitModel(const char* model_path)
     if (!ok) {
         delete g_model; g_model = nullptr; return -2;
     }
+    adopt_model_input_size();
     return 1;
 }
 
@@ -83,6 +104,7 @@ extern "C" __declspec(dllexport) int __stdcall InitModelFromMemory(unsigned char
     if (!ok) {
         delete g_model; g_model = nullptr; return -3;
     }
+    adopt_model_input_size();
     return 1;
 }
 
@@ -93,6 +115,18 @@ extern "C" __declspec(dllexport) int __stdcall YoloDetectFromMemory(
     float* results, int max_size) {
 
     if (!g_model || !img_data || img_size <= 0 || !results || max_size <= 0) return 0;
+
+    // Hard-safety guard: fixed-shape exports (v11m256 etc.) have every Reshape
+    // baked for their declared input size; running them at any other size was
+    // an access violation (observed: v8n@448 crash). Return 0 instead.
+    if (g_input_size_explicit) {
+        std::vector<int> ish;
+        if (g_model->get_input_shape(0, ish) && ish.size() >= 4
+            && ish[2] > 1 && ish[3] > 1
+            && (g_input_h != ish[2] || g_input_w != ish[3])) {
+            return 0;
+        }
+    }
 
     try {
         // 1. 瑙ｇ爜鍥剧墖
@@ -230,7 +264,7 @@ extern "C" __declspec(dllexport) int __stdcall YoloDetectFromMemory(
         std::vector<float> best_score(num_anchors);
         std::vector<int> best_cls(num_anchors);
         int active_anchors = 0;
-        int exact_zero_scores = 0;
+        int tiny_scores = 0; // anchors with peak class score <= 1e-4 (v10 bg)
         for (int i = 0; i < num_anchors; ++i) {
             float max_score = 0;
             int class_id = 0;
@@ -241,7 +275,7 @@ extern "C" __declspec(dllexport) int __stdcall YoloDetectFromMemory(
             best_score[i] = max_score;
             best_cls[i] = class_id;
             if (max_score > 0.01f) active_anchors++;
-            if (max_score == 0.0f) exact_zero_scores++;
+            if (max_score <= 1e-4f) tiny_scores++;
         }
 
         // V10 鍒ゅ畾锛堝弻閲嶉獙璇侊紝闃茶鍒わ級锛?
@@ -249,7 +283,7 @@ extern "C" __declspec(dllexport) int __stdcall YoloDetectFromMemory(
         // 鑰屾櫘閫?v8/v12 sigmoid 鍒嗘暟鍑犱箮涓嶄細绮剧‘涓?0銆備粎鏁伴噺闃堝€间細璇激
         // 绫诲埆灏戙€佽儗鏅姂鍒跺己鐨勮嚜瀹氫箟妯″瀷锛堝 4 绫绘ā鍨嬪彧鏈?<100 涓?anchor 杩?0.01锛夈€?
         bool is_v10_format = (active_anchors < 100) && (num_anchors > 0)
-                             && (exact_zero_scores > num_anchors * 9 / 10);
+                             && (tiny_scores > num_anchors * 9 / 10);
         if (is_v10_format) {
             // 鍑犱綍浜ゅ弶楠岃瘉锛歷10 鐨?box 鏄?xyxy锛岄渶婊¤冻 x2>x1 涓?y2>y1锛?
             // 鍙栧垎鏈€楂樼殑鍑犱釜 anchor 妫€鏌ワ紝鑻ヤ笉婊¤冻鍒欎粛鎸?v8 澶勭悊
@@ -291,7 +325,7 @@ extern "C" __declspec(dllexport) int __stdcall YoloDetectFromMemory(
                 }
 
                 boxes.push_back({
-                    (cx - pad_w) / scale, (cy - pad_h) / scale,
+                    (cx - bw * 0.5f - pad_w) / scale, (cy - bh * 0.5f - pad_h) / scale,
                     bw / scale, bh / scale,
                     max_score, best_cls[i]
                 });
