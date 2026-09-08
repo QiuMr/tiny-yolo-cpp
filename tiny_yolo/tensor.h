@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <climits>
+#include <new>
 #include <vector>
 #include <cassert>
 
@@ -43,9 +45,16 @@ struct Tensor {
     }
 
     // 根据形状分配内存（形状不变时复用旧内存）
+    // 失败时抛 std::bad_alloc（由 run() 统一捕获转成错误码），不再返回悬空指针
     void alloc(const std::vector<int>& s) {
-        int new_numel = 1;
-        for (int d : s) new_numel *= d;
+        // 用 size_t 累加再检查：numel 是 int，超大张量（32 位进程尤其容易触发）
+        // 不能让连乘悄悄回绕成一个小正数，否则后续会按错误长度越界写
+        size_t numel64 = 1;
+        for (int d : s) {
+            if (d != 0) numel64 *= (size_t)(d > 0 ? d : 1);
+        }
+        if (numel64 > (size_t)INT_MAX) throw std::bad_alloc();
+        int new_numel = (int)numel64;
         // 如果已有内存且大小一致，直接复用（避免频繁malloc/free）
         if (own_data && data && new_numel == numel) {
             shape = s;
@@ -69,7 +78,14 @@ struct Tensor {
             strides[i] = stride;
             stride *= shape[i];
         }
-        data = (float*)malloc(numel * sizeof(float));
+        data = (float*)malloc((size_t)numel * sizeof(float));
+        if (!data) {
+            // 32 位进程地址空间紧张，大模型的中层张量完全可能分配失败。
+            // 抛异常由上层捕获转成错误码，比留一个 nullptr 让算子去写要安全得多
+            numel = 0;
+            own_data = false;
+            throw std::bad_alloc();
+        }
         own_data = true;
     }
 

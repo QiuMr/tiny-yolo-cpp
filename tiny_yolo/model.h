@@ -12,6 +12,15 @@
 #include <string>
 #include <unordered_map>
 #include <chrono>
+#include <new>
+
+// Load-time diagnostics are OFF by default. The host is usually a GUI process
+// (Yi language) with no console, so unconditional stderr writes are at best
+// useless. Set TINY_YOLO_LOG=1 to bring them back.
+static inline bool tyro_log_enabled() {
+    static const bool on = (getenv("TINY_YOLO_LOG") != nullptr);
+    return on;
+}
 
 struct OpInstance {
     uint8_t op_type;
@@ -37,6 +46,10 @@ public:
     std::vector<uint8_t> weights_data; // 甯搁噺鏉冮噸鏁版嵁鍖?
     std::vector<std::string> input_names;
     std::vector<std::string> output_names;
+    // Output tensor ids resolved in output_names order. get_output() used to
+    // guess "last op, output 0", which silently returns the wrong tensor on any
+    // graph whose output is not produced by the final node.
+    std::vector<uint16_t> output_tensor_ids;
     std::unordered_map<std::string, uint16_t> name_to_id;
     bool loaded = false;
 
@@ -73,33 +86,71 @@ public:
         SimpleThreadPool::instance().init(nth);
     }
 
-    bool load_from_file(const char* path) {
-        init_thread_pool();
+    // Unified byte source: lets the .tyro parser run off a FILE* or a memory
+    // buffer, so in-memory model loading needs no temp-file round-trip.
+    struct ByteReader {
+        FILE* f = nullptr;
+        const uint8_t* p = nullptr;
+        const uint8_t* end = nullptr;
+        bool ok = true;
 
+        bool read(void* dst, size_t n) {
+            if (!ok || n == 0) return true;
+            if (f) {
+                if (fread(dst, 1, n, f) != n) { ok = false; return false; }
+                return true;
+            }
+            if ((size_t)(end - p) < n) { ok = false; return false; }
+            memcpy(dst, p, n);
+            p += n;
+            return true;
+        }
+    };
+
+    bool load_from_file(const char* path) {
         FILE* f = fopen(path, "rb");
         if (!f) return false;
+        ByteReader r;
+        r.f = f;
+        bool ok = load_tyro(r);
+        fclose(f);
+        return ok;
+    }
+
+    // Load a .tyro model directly from memory (InitModelFromMemory path).
+    bool load_from_file_mem(const uint8_t* data, size_t size) {
+        if (!data || size < sizeof(TyroHeader)) return false;
+        ByteReader r;
+        r.p = data;
+        r.end = data + size;
+        return load_tyro(r);
+    }
+
+    // Shared .tyro parser used by both entry points above.
+    bool load_tyro(ByteReader& r) {
+        init_thread_pool();
 
         // 璇诲ご閮?
         TyroHeader header;
-        if (fread(&header, sizeof(header), 1, f) != 1) { fclose(f); return false; }
-        if (header.magic != TYO_MAGIC) { fclose(f); return false; }
+        if (!r.read(&header, sizeof(header))) return false;
+        if (header.magic != TYO_MAGIC) return false;
 
         // 璇昏緭鍏ュ悕
         input_names.resize(header.input_count);
         for (int i = 0; i < header.input_count; i++) {
             uint16_t len;
-            fread(&len, sizeof(len), 1, f);
+            r.read(&len, sizeof(len));
             input_names[i].resize(len);
-            fread(&input_names[i][0], 1, len, f);
+            r.read(&input_names[i][0], len);
         }
 
         // 璇昏緭鍑哄悕
         output_names.resize(header.output_count);
         for (int i = 0; i < header.output_count; i++) {
             uint16_t len;
-            fread(&len, sizeof(len), 1, f);
+            r.read(&len, sizeof(len));
             output_names[i].resize(len);
-            fread(&output_names[i][0], 1, len, f);
+            r.read(&output_names[i][0], len);
         }
 
         // 璇诲紶閲忚〃
@@ -108,20 +159,20 @@ public:
             TensorInfo& ti = tensor_infos[i];
             // 璇诲浐瀹氶儴鍒?(TensorDesc: id(2) + ndim(1) + dtype(1) + is_const(1) + reserved(3) + offset(4) = 12)
             uint16_t id; uint8_t ndim, dtype, is_const, r1, r2, r3; uint32_t offset;
-            fread(&id, 2, 1, f);
-            fread(&ndim, 1, 1, f);
-            fread(&dtype, 1, 1, f);
-            fread(&is_const, 1, 1, f);
-            fread(&r1, 1, 1, f);
-            fread(&r2, 1, 1, f);
-            fread(&r3, 1, 1, f);
-            fread(&offset, 4, 1, f);
+            r.read(&id, 2);
+            r.read(&ndim, 1);
+            r.read(&dtype, 1);
+            r.read(&is_const, 1);
+            r.read(&r1, 1);
+            r.read(&r2, 1);
+            r.read(&r3, 1);
+            r.read(&offset, 4);
             ti.id = id; ti.ndim = ndim; ti.dtype = dtype;
             ti.is_const = is_const; ti.data_offset = offset;
             ti.shape.resize(ndim);
             for (int d = 0; d < ndim; d++) {
                 int32_t v;
-                fread(&v, 4, 1, f);
+                r.read(&v, 4);
                 ti.shape[d] = v;
             }
         }
@@ -131,26 +182,25 @@ public:
         for (int i = 0; i < header.op_count; i++) {
             OpInstance& op = ops[i];
             uint8_t optype, incnt, outcnt, attrsize;
-            fread(&optype, 1, 1, f);
-            fread(&incnt, 1, 1, f);
-            fread(&outcnt, 1, 1, f);
-            fread(&attrsize, 1, 1, f);
+            r.read(&optype, 1);
+            r.read(&incnt, 1);
+            r.read(&outcnt, 1);
+            r.read(&attrsize, 1);
             op.op_type = optype;
             op.attr_data.resize(attrsize);
-            if (attrsize > 0) fread(op.attr_data.data(), 1, attrsize, f);
+            if (attrsize > 0) r.read(op.attr_data.data(), attrsize);
             op.input_ids.resize(incnt);
-            for (int j = 0; j < incnt; j++) { uint16_t v; fread(&v, 2, 1, f); op.input_ids[j] = v; }
+            for (int j = 0; j < incnt; j++) { uint16_t v; r.read(&v, 2); op.input_ids[j] = v; }
             op.output_ids.resize(outcnt);
-            for (int j = 0; j < outcnt; j++) { uint16_t v; fread(&v, 2, 1, f); op.output_ids[j] = v; }
+            for (int j = 0; j < outcnt; j++) { uint16_t v; r.read(&v, 2); op.output_ids[j] = v; }
         }
 
         // 璇绘潈閲嶆暟鎹?
         weights_data.resize(header.weights_size);
         if (header.weights_size > 0) {
-            fread(weights_data.data(), 1, header.weights_size, f);
+            r.read(weights_data.data(), header.weights_size);
         }
-
-        fclose(f);
+        if (!r.ok) return false;
 
         // 初始化运行时张量
         tensors.resize(tensor_infos.size());
@@ -183,28 +233,35 @@ public:
 
     // 从ONNX文件加载模型
     bool load_from_onnx(const char* path) {
+        FILE* f = fopen(path, "rb");
+        if (!f) return false;
+        fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
+        if (fsz <= 0) { fclose(f); return false; }
+        std::vector<uint8_t> data((size_t)fsz);
+        if (fread(data.data(), 1, (size_t)fsz, f) != (size_t)fsz) { fclose(f); return false; }
+        fclose(f);
+        return load_from_onnx_mem(data.data(), data.size());
+    }
+
+    // Load an ONNX model straight from memory. No temp file is written, so the
+    // "embed model in resources / download it" scenario really stays off disk.
+    bool load_from_onnx_mem(const uint8_t* data, size_t size) {
+        if (!data || size == 0) return false;
         release();
 
         init_thread_pool();
 
-        // 1. 读取文件
-        FILE* f = fopen(path, "rb");
-        if (!f) { fprintf(stderr, "Cannot open %s\n", path); return false; }
-        fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
-        std::vector<uint8_t> data(fsz);
-        fread(data.data(), 1, fsz, f);
-        fclose(f);
-
-        // 2. 解析ONNX
-        onnx_lite::OnnxModel onnx_model = onnx_lite::parse_onnx(data.data(), data.size());
-        fprintf(stderr, "ONNX: %zu nodes, %zu initializers\n",
-            onnx_model.nodes.size(), onnx_model.initializers.size());
+        onnx_lite::OnnxModel onnx_model = onnx_lite::parse_onnx(data, size);
+        if (tyro_log_enabled())
+            fprintf(stderr, "ONNX: %zu nodes, %zu initializers\n",
+                onnx_model.nodes.size(), onnx_model.initializers.size());
 
         // 2.1 图优化：融合Conv+SiLU和Softmax
         int fused_silu = fuse_conv_silu(onnx_model.nodes);
         int fused_softmax = fuse_softmax(onnx_model.nodes);
-        fprintf(stderr, "Fused: %d ConvSiLU, %d Softmax, %zu nodes remaining\n",
-            fused_silu, fused_softmax, onnx_model.nodes.size());
+        if (tyro_log_enabled())
+            fprintf(stderr, "Fused: %d ConvSiLU, %d Softmax, %zu nodes remaining\n",
+                fused_silu, fused_softmax, onnx_model.nodes.size());
 
         // 3. 建立tensor name到id的映射
         std::unordered_map<std::string, uint16_t> n2id;
@@ -435,8 +492,17 @@ public:
             ops.push_back(std::move(op));
         }
 
-        fprintf(stderr, "Built: %zu tensors, %zu ops, %zu bytes weights\n",
-            tensor_infos.size(), ops.size(), weights_data.size());
+        // Resolve the real output tensor ids while the local name map is still
+        // alive, so get_output() no longer has to guess from ops.back().
+        output_tensor_ids.clear();
+        for (const auto& nm : output_names) {
+            auto it = n2id.find(nm);
+            output_tensor_ids.push_back(it != n2id.end() ? it->second : (uint16_t)0);
+        }
+
+        if (tyro_log_enabled())
+            fprintf(stderr, "Built: %zu tensors, %zu ops, %zu bytes weights\n",
+                tensor_infos.size(), ops.size(), weights_data.size());
 
         // 6. 初始化运行时张量
         tensors.resize(tensor_infos.size());
@@ -479,14 +545,23 @@ public:
 
     // 鑾峰彇杈撳嚭寮犻噺鏁版嵁
     const Tensor* get_output(int idx) {
-        if (idx >= (int)output_names.size()) return nullptr;
+        if (idx < 0 || idx >= (int)output_names.size()) return nullptr;
+        if (idx < (int)output_tensor_ids.size()) {
+            uint16_t tid = output_tensor_ids[idx];
+            return (tid < tensors.size()) ? &tensors[tid] : nullptr;
+        }
         // 杈撳嚭寮犻噺閫氬父鍦ㄥ紶閲忚〃鐨勫悗闈紝鎸夊悕瀛楁煡鎵?
         // 绠€鍖栵細閬嶅巻鎵炬渶鍚庡嚑涓潪甯搁噺寮犻噺
         // 瀹為檯涓婃垜浠渶瑕?name_to_id 鏄犲皠锛屼絾杞崲鏃舵病瀛樺悕瀛?
         // 鐢ㄨ緭鍑洪『搴忥細杈撳嚭寮犻噺鏄浘鐨勬渶鍚庤緭鍑?
         // 鎵炬渶鍚庝竴涓畻瀛愮殑杈撳嚭
+        // Legacy .tyro fallback (no name -> id map). Bounds-checked now: the
+        // old code indexed output_ids[] without any range check at all.
         if (ops.empty()) return nullptr;
-        uint16_t tid = ops.back().output_ids[idx];
+        const std::vector<uint16_t>& ids = ops.back().output_ids;
+        if (idx >= (int)ids.size()) return nullptr;
+        uint16_t tid = ids[idx];
+        if (tid >= tensors.size()) return nullptr;
         return &tensors[tid];
     }
 
@@ -501,9 +576,17 @@ public:
         double op_time[256] = {0};
         int op_count[256] = {0};
 
+        // Tensor/temp-buffer allocation now throws bad_alloc instead of handing
+        // back a null pointer; catch it here so a 32-bit OOM becomes a clean
+        // "inference failed" instead of an access violation in some kernel.
+        try {
         for (size_t i = 0; i < ops.size(); i++) {
             OpInstance& op = ops[i];
-            auto t0 = std::chrono::high_resolution_clock::now();
+            // Only touch the clock when profiling: chrono::now() is a
+            // QueryPerformanceCounter call and a typical YOLO graph has several
+            // hundred ops, so doing it unconditionally cost a QPC per op/frame.
+            std::chrono::high_resolution_clock::time_point t0;
+            if (prof_enabled) t0 = std::chrono::high_resolution_clock::now();
             if (!execute_op(op)) {
                 printf("Op %zu failed! op_type=%d inputs=%zu outputs=%zu\n", i, op.op_type, op.input_ids.size(), op.output_ids.size());
                 for (size_t k = 0; k < op.input_ids.size(); k++) {
@@ -569,6 +652,18 @@ public:
                 }
             }
         }
+        } catch (const std::bad_alloc&) {
+            if (tyro_log_enabled())
+                fprintf(stderr, "run(): out of memory allocating a tensor/temp buffer\n");
+            return false;
+        } catch (const std::exception& e) {
+            if (tyro_log_enabled())
+                fprintf(stderr, "run(): exception: %s\n", e.what());
+            return false;
+        } catch (...) {
+            return false;
+        }
+
         if (prof_enabled) {
             fprintf(stderr, "=== Op Performance ===\n");
             for (int t = 0; t < 256; t++) {

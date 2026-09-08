@@ -37,7 +37,19 @@ static void adopt_model_input_size() {
     }
 }
 
+// Tear down the current model AND reset the input-size state. Both must happen
+// together: if g_input_size_explicit survives a model swap, the next load keeps
+// the previous resolution and then gets silently blocked by the size guard in
+// YoloDetectFromMemory -- permanent 0 detections with no error anywhere.
+static void release_model() {
+    if (g_model) { delete g_model; g_model = nullptr; }
+    g_input_size_explicit = false;
+    g_input_w = 640;
+    g_input_h = 640;
+}
+
 extern "C" __declspec(dllexport) void __stdcall SetInputSize(int w, int h) {
+    if (w <= 0 || h <= 0) return;
     g_input_w = w;
     g_input_h = h;
     g_input_size_explicit = true;
@@ -63,8 +75,9 @@ static inline float iou(const Box& a, const Box& b) {
 
 // 鍔犺浇妯″瀷锛堜粠 .tyro 鏂囦欢璺緞锛?
 extern "C" __declspec(dllexport) int __stdcall InitModel(const char* model_path) {
-    if (g_model) return 1;
     if (!model_path) return -1;
+    // A second InitModel() used to return 1 while keeping the previous model.
+    if (g_model) release_model();
     g_model = new TinyModel();
 
     // 鏍规嵁鏂囦欢鎵╁睍鍚嶅垽鏂牸寮?
@@ -87,20 +100,22 @@ extern "C" __declspec(dllexport) int __stdcall InitModel(const char* model_path)
 
 // 浠庡唴瀛樺姞杞芥ā鍨嬫暟鎹紙鑷姩璇嗗埆 tyro / onnx 鏍煎紡锛?
 extern "C" __declspec(dllexport) int __stdcall InitModelFromMemory(unsigned char* model_data, int model_size) {
-    if (g_model) return 1;
     if (!model_data || model_size <= 0) return -1;
+    if (g_model) release_model();
     // 鎸夐瓟鏁板垎娴侊細TYO1 = tyro 鏍煎紡锛涘惁鍒欏綋浣?ONNX (protobuf)
-    bool is_tyro = (model_size >= 4 && *(const uint32_t*)model_data == TYO_MAGIC);
-    char tempFile[MAX_PATH];
-    GetTempPathA(MAX_PATH, tempFile);
-    strcat_s(tempFile, is_tyro ? "tiny_yolo_model.tyro" : "tiny_yolo_model.onnx");
-    FILE* f = fopen(tempFile, "wb");
-    if (!f) return -2;
-    fwrite(model_data, 1, model_size, f);
-    fclose(f);
+    // Compare bytes instead of reinterpreting the buffer as uint32_t: the
+    // caller's byte array is not guaranteed to be 4-byte aligned.
+    bool is_tyro = (model_size >= 4 && model_data[0] == 'T' && model_data[1] == 'Y'
+                    && model_data[2] == 'O' && model_data[3] == '1');
+
+    // Parse straight out of the caller's buffer. The old implementation wrote
+    // the model to %TEMP% under a fixed name and never deleted it, so "load
+    // from memory" both touched the disk and leaked a full-size model file.
+    // Both loaders copy the weights into their own storage, so the caller is
+    // free to release the buffer as soon as this returns.
     g_model = new TinyModel();
-    bool ok = is_tyro ? g_model->load_from_file(tempFile)
-                      : g_model->load_from_onnx(tempFile);
+    bool ok = is_tyro ? g_model->load_from_file_mem(model_data, (size_t)model_size)
+                      : g_model->load_from_onnx_mem(model_data, (size_t)model_size);
     if (!ok) {
         delete g_model; g_model = nullptr; return -3;
     }
@@ -115,6 +130,12 @@ extern "C" __declspec(dllexport) int __stdcall YoloDetectFromMemory(
     float* results, int max_size) {
 
     if (!g_model || !img_data || img_size <= 0 || !results || max_size <= 0) return 0;
+
+    // Threshold guard. Callers that forward an "omitted" optional argument can
+    // pass 0, and conf=0 lets every one of the 8400 anchors into an O(n^2) NMS
+    // pass -- it reads as a hang. Written as !(x > 0) so NaN is caught too.
+    if (!(conf_thres > 0.0f)) conf_thres = 0.25f;
+    if (!(nms_thres > 0.0f)) nms_thres = 0.45f;
 
     // Hard-safety guard: fixed-shape exports (v11m256 etc.) have every Reshape
     // baked for their declared input size; running them at any other size was
@@ -142,26 +163,52 @@ extern "C" __declspec(dllexport) int __stdcall YoloDetectFromMemory(
             printf("[det] img=%dx%d scale=%.4f pad=%d,%d raw_box@3392 will follow\n",
                    w, h, scale, pad_w, pad_h);
 
-        unsigned char* resized = (unsigned char*)malloc(new_w * new_h * 3);
+        unsigned char* resized = (unsigned char*)malloc((size_t)new_w * new_h * 3);
+        if (!resized) { stbi_image_free(img); return 0; }
         stbir_resize_uint8_linear(img, w, h, 0, resized, new_w, new_h, 0, (stbir_pixel_layout)3);
         stbi_image_free(img);
 
         // 3. 杞?NCHW float32 + 褰掍竴鍖栵紙letterbox 濉厖鍊?114 鐏帮級
         // 缂撳啿璺ㄥ抚澶嶇敤锛氳竟鐣屾亽涓?114 鐏帮紝棣栧抚濉ソ鍚庢棤闇€閲嶅～锛屼腑蹇冨尯鍩熸瘡甯ф暣浣撹鐩?
+        // Reused across frames, but only safe while the letterbox geometry is
+        // unchanged. The padding is supposed to stay 114 gray, yet each frame
+        // only rewrites the [pad_h, pad_h+new_h) x [pad_w, pad_w+new_w) window;
+        // when the aspect ratio changes, cells the previous frame wrote outside
+        // this window keep the old pixels. So refill whenever geometry changes.
+        // Same-size frames (video, repeated captures) still take the fast path.
         static thread_local std::vector<float> tensor_data;
+        static thread_local int last_new_w = -1, last_new_h = -1;
+        static thread_local int last_pad_w = -1, last_pad_h = -1;
         size_t tensor_size = (size_t)3 * g_input_h * g_input_w;
-        if (tensor_data.size() != tensor_size) tensor_data.assign(tensor_size, 114.0f / 255.0f);
+        bool geom_changed = (new_w != last_new_w || new_h != last_new_h
+                             || pad_w != last_pad_w || pad_h != last_pad_h);
+        if (tensor_data.size() != tensor_size) {
+            tensor_data.assign(tensor_size, 114.0f / 255.0f);
+        } else if (geom_changed) {
+            std::fill(tensor_data.begin(), tensor_data.end(), 114.0f / 255.0f);
+        }
+        last_new_w = new_w; last_new_h = new_h;
+        last_pad_w = pad_w;  last_pad_h = pad_h;
+
         float* ptr_r = tensor_data.data();
         float* ptr_g = ptr_r + g_input_w * g_input_h;
         float* ptr_b = ptr_g + g_input_w * g_input_h;
+
+        // 256-entry LUT replaces x / 255.0f: 3*H*W divisions per frame
+        // (~1.2M at 640x640) become plain table lookups.
+        struct NormLut {
+            float v[256];
+            NormLut() { for (int i = 0; i < 256; i++) v[i] = (float)i / 255.0f; }
+        };
+        static const NormLut lut;
 
         for (int y = 0; y < new_h; ++y) {
             for (int x = 0; x < new_w; ++x) {
                 int dst = (y + pad_h) * g_input_w + (x + pad_w);
                 int src = (y * new_w + x) * 3;
-                ptr_r[dst] = resized[src + 0] / 255.0f;
-                ptr_g[dst] = resized[src + 1] / 255.0f;
-                ptr_b[dst] = resized[src + 2] / 255.0f;
+                ptr_r[dst] = lut.v[resized[src + 0]];
+                ptr_g[dst] = lut.v[resized[src + 1]];
+                ptr_b[dst] = lut.v[resized[src + 2]];
             }
         }
         free(resized);
@@ -261,8 +308,11 @@ extern "C" __declspec(dllexport) int __stdcall YoloDetectFromMemory(
         int classes = num_channels - 4;
 
         // 鍗曟鎵弿锛氭眰姣忎釜 anchor 鐨勬渶澶х被鍒垎骞剁紦瀛橈紙鍘熷疄鐜版壂涓ら亶锛岃法姝ヨ瀛樼炕鍊嶏級
-        std::vector<float> best_score(num_anchors);
-        std::vector<int> best_cls(num_anchors);
+        // Reused across frames instead of allocating ~67KB on every call.
+        static thread_local std::vector<float> best_score;
+        static thread_local std::vector<int> best_cls;
+        best_score.resize(num_anchors);
+        best_cls.resize(num_anchors);
         int active_anchors = 0;
         int tiny_scores = 0; // anchors with peak class score <= 1e-4 (v10 bg)
         for (int i = 0; i < num_anchors; ++i) {
@@ -356,7 +406,7 @@ extern "C" __declspec(dllexport) int __stdcall YoloDetectFromMemory(
 }
 
 extern "C" __declspec(dllexport) void __stdcall ReleaseModel() {
-    if (g_model) { delete g_model; g_model = nullptr; }
+    release_model();
 }
 
 BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID l) {

@@ -807,7 +807,12 @@ static inline float* get_temp_buf(size_t numel) {
     static thread_local Holder buf;
     if (numel > buf.cap) {
         float* np = (float*)realloc(buf.p, numel * sizeof(float));
-        if (!np) return nullptr;
+        if (!np) {
+            // 这里原先返回 nullptr，而 6 个调用点全都不判空，下一句就是
+            // `ws + offset` / memset —— Winograd 大层单次申请可达 ~70MB，
+            // 32 位下失败即空指针解引用崩溃。改为抛异常，由 run() 捕获转错误码。
+            throw std::bad_alloc();
+        }
         buf.p = np;
         buf.cap = numel;
     }

@@ -33,6 +33,8 @@
 > v11m256 冷机对标（同一热量窗口 A/B）：Winograd 标量 128ms → F4 SIMD 110ms（-14%）。
 > 5560U 为 15W U 系列，持续负载受功耗墙限制（实测线程数 4~12 耗时几乎相同）。
 > 同机 ONNX Runtime 256 输入约 44ms，差距主要在 INT8 与更深度的打包微内核。
+> 2026-09-08 一轮 Bug 修复 + 预处理优化后实测（yolo11n@640 / 1.jpg / x86 Release）：
+> **143ms → 136ms**，检出框与修复前逐位一致（无精度退化）。
 
 ## 快速开始
 
@@ -105,12 +107,33 @@ cl /O2 /EHsc test_tiny.cpp /Fetest_tiny.exe
 test_tiny.exe yolo11n.onnx zidane.jpg 640 0.25
 ```
 
+### 回归测试
+
+`test_fixes.cpp` 覆盖**已经修掉的历史缺陷**，每个用例在修复前都会失败，用于防止回归：
+
+```bat
+:: x86 Native Tools Command Prompt，需先按"编译"一节生成 tiny_yolo_x86.dll
+cl /O2 /EHsc test_fixes.cpp /Fetest_fixes.exe
+test_fixes.exe          :: 同目录需有 1.jpg / tall.jpg 与用到的 .onnx
+```
+
+| 用例 | 覆盖的缺陷 |
+|------|-----------|
+| T1 | `ReleaseModel` 后换模型，被上一次 `SetInputSize` 残留的尺寸静默拦截（永久 0 检出） |
+| T2 | `InitModelFromMemory` 曾把模型写到 `%TEMP%` 且从不删除 |
+| T3 | 未释放时重复 `InitModel` 静默沿用旧模型 |
+| T4 | letterbox 缓冲跨帧复用，上一帧像素污染填充区（曾造成误检） |
+| T5 | 置信度 / NMS 阈值为 0 时缺少兜底 |
+| T6 | v8 / v10 / v26 多模型交叉冒烟 |
+
+> 修复前 **13 通过 / 4 失败**，修复后 **17 通过 / 0 失败**。
+
 ## API
 
 | 导出函数 | 说明 |
 |----------|------|
 | InitModel(path) | 加载 .onnx 或 .tyro 文件，返回 1 成功 |
-| InitModelFromMemory(data, size) | 从内存加载，自动识别格式 |
+| InitModelFromMemory(data, size) | 从内存加载，自动识别格式。**不写任何临时文件**，返回后调用方可立即释放字节集 |
 | SetInputSize(w,h) | 设置输入分辨率，默认 640；未显式调用时自动采用模型声明的输入尺寸 |
 | YoloDetectFromMemory(img,size,conf,nms,results,max) | 推理，返回检出数 |
 | ReleaseModel() | 释放模型 |
@@ -160,6 +183,7 @@ python convert_model.py yolo11n.onnx yolo11n.tyro
 | TINY_YOLO_NO_SILU=1 | 禁用融合 SiLU（定位数值问题） |
 | TINY_YOLO_THREADS=N | 强制线程数 |
 | TINY_YOLO_NO_SIMD=1 | 关闭 Winograd F4 SIMD 变换（数值对照/定位性能用） |
+| TINY_YOLO_LOG=1 | 打印模型加载期日志（节点数 / 融合数 / 权重大小）。**默认关闭**：易语言等 GUI 宿主没有控制台 |
 
 辅助工具源码：ort_dump.cpp（ONNX Runtime 对照基准）、test_weights.cpp（权重 NaN 扫描）、
 test_s2.cpp / test_wino.cpp（卷积内核对拍测试）、test_initmem.cpp（内存加载路径测试）。
@@ -191,6 +215,30 @@ test_s2.cpp / test_wino.cpp（卷积内核对拍测试）、test_initmem.cpp（�
 
 </details>
 
+<details>
+<summary><b>已修复的稳定性 / 接口 Bug（2026-09-08）</b></summary>
+
+- **`ReleaseModel` 不重置输入尺寸标记（最坑）**：`SetInputSize(512)` → `释放模型()` → `加载模型(另一个模型)`，第二次加载仍沿用 512，与模型声明尺寸不符时被尺寸守卫**静默拦截，永远返回 0 个检出且无任何报错**。现在释放模型与输入尺寸状态一起重置。
+- **letterbox 缓冲跨帧复用污染**：输入张量缓冲只在分辨率变化时才填 114 灰，之后每帧只覆写图像窗口。宽高比变化后，上一帧写过而本帧覆盖不到的区域**保留旧像素**，被模型当成真实内容——实测在一张 320x800 图上凭空多出 3 个误检框。现在几何一旦变化就整块重填（同尺寸连续帧仍走快路径）。
+- **`InitModelFromMemory` 名不副实**：实际把模型写到 `%TEMP%\tiny_yolo_model.onnx`（固定名、从不删除、多进程冲突），既落盘又泄漏。现在从调用方缓冲直接解析；两个加载器都会把权重拷进自有内存，调用返回后即可释放字节集。
+- **临时缓冲分配失败未判空**：`get_temp_buf` 失败返回 `nullptr`，6 个调用点全部直接使用（Winograd 大层单次申请可达 ~70MB，32 位下失败即崩溃）。现在改为抛 `std::bad_alloc`，由 `run()` 统一捕获转成错误码。
+- **`get_output` 靠猜**：直接取 `ops.back().output_ids[idx]`，且从不检查越界（`name_to_id` 成员声明后从未填充）。现在按 `output_names` 解析真实输出 id，并对下标与张量 id 做边界检查。
+- **重复 `InitModel` 静默沿用旧模型**：`if (g_model) return 1;`，换模型无效还返回成功。现在会先释放旧模型。
+- **阈值缺少兜底**：`conf_thres=0` 会让全部 8400 个 anchor 进入 O(n²) NMS（表现为卡死）。现在 0 / 负数 / NaN 一律回落到 0.25 / 0.45。
+- **其他**：`Tensor::alloc` 与图片缩放缓冲的 `malloc` 不判空；张量元素数用 `int` 连乘存在溢出风险（已加 `size_t` 检查）；加载期无条件 `fprintf(stderr)`（GUI 宿主无控制台，已改为 `TINY_YOLO_LOG=1` 才输出）；`InitModelFromMemory` 对未对齐缓冲做 `uint32_t` 强转（改为逐字节比较）。
+
+</details>
+
+<details>
+<summary><b>性能优化记录（2026-09-08）</b></summary>
+
+- 预处理归一化改用 256 项查找表替代 `x / 255.0f`：640 输入每帧省掉约 120 万次除法
+- `run()` 里每算子无条件调用 `chrono::now()`（一次 QueryPerformanceCounter），改为仅在开启 `TINY_YOLO_PROFILE` 时计时
+- 后处理的 `best_score` / `best_cls` 改为 `thread_local` 复用，不再每帧申请约 67KB
+- 合计：yolo11n@640 由 143ms 降至 136ms，检出框逐位一致
+
+</details>
+
 ## 目录
 
 ```
@@ -207,6 +255,8 @@ tiny_yolo/
 convert_model.py      ONNX → .tyro 转换器
 stb_image.h           图片解码
 test_tiny.cpp         测试程序
+test_fixes.cpp        Bug 回归测试（17 项，见"回归测试"一节）
+tall.jpg              回归测试 T4 用的极端宽高比图（320x800）
 易语言_YOLO识别模块.txt  易语言模块源码(导入即用)
 易语言_使用示例.txt      易语言三行用法示例
 YOLO推理引擎.ec        编译好的易语言模块
