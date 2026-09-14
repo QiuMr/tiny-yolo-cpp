@@ -41,8 +41,11 @@ static void adopt_model_input_size() {
 // together: if g_input_size_explicit survives a model swap, the next load keeps
 // the previous resolution and then gets silently blocked by the size guard in
 // YoloDetectFromMemory -- permanent 0 detections with no error anywhere.
-static void release_model() {
+static void release_model(bool keep_explicit_size = false) {
     if (g_model) { delete g_model; g_model = nullptr; }
+    // InitModel 内部调用时保留用户刚设的显式尺寸（支持 SetInputSize 先于 InitModel 的写法）；
+    // 用户主动 ReleaseModel() 时清除，避免残留尺寸静默拦截下一个模型（T1 回归）。
+    if (keep_explicit_size) return;
     g_input_size_explicit = false;
     g_input_w = 640;
     g_input_h = 640;
@@ -77,7 +80,7 @@ static inline float iou(const Box& a, const Box& b) {
 extern "C" __declspec(dllexport) int __stdcall InitModel(const char* model_path) {
     if (!model_path) return -1;
     // A second InitModel() used to return 1 while keeping the previous model.
-    if (g_model) release_model();
+    if (g_model) release_model(true);
     g_model = new TinyModel();
 
     // 鏍规嵁鏂囦欢鎵╁睍鍚嶅垽鏂牸寮?
@@ -101,7 +104,7 @@ extern "C" __declspec(dllexport) int __stdcall InitModel(const char* model_path)
 // 浠庡唴瀛樺姞杞芥ā鍨嬫暟鎹紙鑷姩璇嗗埆 tyro / onnx 鏍煎紡锛?
 extern "C" __declspec(dllexport) int __stdcall InitModelFromMemory(unsigned char* model_data, int model_size) {
     if (!model_data || model_size <= 0) return -1;
-    if (g_model) release_model();
+    if (g_model) release_model(true);
     // 鎸夐瓟鏁板垎娴侊細TYO1 = tyro 鏍煎紡锛涘惁鍒欏綋浣?ONNX (protobuf)
     // Compare bytes instead of reinterpreting the buffer as uint32_t: the
     // caller's byte array is not guaranteed to be 4-byte aligned.

@@ -239,6 +239,31 @@ test_s2.cpp / test_wino.cpp（卷积内核对拍测试）、test_initmem.cpp（�
 
 </details>
 
+<details>
+<summary><b>已修复的数值/正确性 Bug（2026-09-14）</b></summary>
+
+- **Constant 节点产出的 int64 张量被降级成 float**：ONNX `Constant` 分支无条件把 dtype 写成 FLOAT（int64 值转 float 存 4 字节），而 Reshape / Slice / ReduceMax 的消费端在 `dtype != INT64/INT32` 时按 **8 字节**读同一块内存，shape 解析出垃圾值后静默出错图。现在保留原始 dtype，int64 按 8 字节存储。
+- **Reshape / Slice / ReduceMax 的兜底分支按 int64 错读**：这三处的 `else` 落到 `(const int64_t*)data`，与 Unsqueeze / Tile / TopK 已有的「按 float 读」约定相反。已统一为按 4 字节 float 读。
+- **`get_output` 查名失败回落到输入张量**：`output_tensor_ids` 用 `0` 作未解析标记，而 id 0 恰好是第一个输入张量，`get_output` 会返回错张量当检测输出。改用 `0xFFFF` 哨兵并返回 `nullptr`。
+- **Conv+SiLU / Softmax 融合不查消费者数**：Conv 输出若还被残差 / Concat 分支消费，融合后改名会让那些节点读到无生产者的张量。现在融合前要求 conv_out 恰好被 2 个节点消费、sigmoid_out 恰好 1 个（Softmax 同理要求 4 个中间张量各只有唯一消费者）。
+- **融合出的 Softmax 属性残留**：原 ReduceMax 带的是 `axes`/`keepdims`，而 `op_softmax` 找的是 `axis` 且遇到第一个非 axis 属性就 break —— 之前靠「DFL 的 softmax 正好在末维」这个巧合工作。现在显式清属性并写入 `axis=-1`。
+- **分组卷积缓冲分配的恒真条件**：`max_numel = max(a,b)` 后再判 `a+b > max(a,b)` 永远成立，那条「复用 temp buffer 后半段」的分支是死代码；一旦生效，收尾的 `free()` 会释放 temp buffer 内部指针（堆破坏）。已改为独立 `malloc` + 判空抛 `bad_alloc`。
+- **`SetInputSize` 先于 `InitModel` 时尺寸被静默清掉**：`InitModel` 开头的 `release_model()` 会重置显式尺寸标记。现在内部调用保留用户刚设的尺寸，仅用户主动 `ReleaseModel()` 时清除（T1 回归不受影响）。
+
+</details>
+
+<details>
+<summary><b>性能改动（2026-09-14）</b></summary>
+
+- `gemm_nm_core` 的 N 分块 `NB` 6 → 8，标量尾循环同步扩到 8 路，AVX2 累加器从 6 个增到 8 个
+- **`NB` 必须与 `gemm_nm()` 的 `CH` 同值**：实测 `NB=6` 配 `CH=8` 会把 8 通道块拆成 6+2，第二次调用 `ni=2` 严重欠用寄存器，比 `CH=6` 还慢 2~6ms
+- 非 packed 路径 `CH` 6 → 8；`mb` 上限 8 → 32（12 线程不再有空转）
+- 线程数改为 `hardware_concurrency() - 1`（主线程也参与 `parallel_for`，避免超订）
+
+> 注：本轮性能改动**未取得可信的 A/B 结论**。同机对照中同一个基线 DLL 在不同轮次测出 117ms 与 128ms（约 9% 漂移），大于预期收益；`NB`/`CH` 同值这条是唯一在两轮对照中方向一致的结论。检出框与修复前逐位一致，无精度退化。
+
+</details>
+
 ## 目录
 
 ```

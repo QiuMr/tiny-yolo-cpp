@@ -502,7 +502,9 @@ static inline void gemm_nm_core(const float* X, const float* W, const float* bia
                                  float* Out, int N, int M, int K, bool silu,
                                  int m0 = 0, int m1 = -1) {
     if (m1 < 0) m1 = M;
-    const int NB = 6;
+    // NB 必须与 gemm_nm() 里的 CH 同值：NB=6 配 CH=8 会把 8 通道块拆成
+    // 6+2，第二次调用 ni=2 效率极低（实测比 CH=6 还慢）。
+    const int NB = 8;
     int num_blocks = (N + NB - 1) / NB;
     for (int blk = 0; blk < num_blocks; blk++) {
         int n0 = blk * NB;
@@ -515,6 +517,7 @@ static inline void gemm_nm_core(const float* X, const float* W, const float* bia
             __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
             __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
             __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
+            __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
             const float* xk = X + m;
             for (int k = 0; k < K; k++, xk += M) {
                 __m256 xv = _mm256_loadu_ps(xk);
@@ -524,11 +527,14 @@ static inline void gemm_nm_core(const float* X, const float* W, const float* bia
                 if (ni > 3) acc3 = _mm256_fmadd_ps(_mm256_broadcast_ss(w0 + 3 * (size_t)K + k), xv, acc3);
                 if (ni > 4) acc4 = _mm256_fmadd_ps(_mm256_broadcast_ss(w0 + 4 * (size_t)K + k), xv, acc4);
                 if (ni > 5) acc5 = _mm256_fmadd_ps(_mm256_broadcast_ss(w0 + 5 * (size_t)K + k), xv, acc5);
+                if (ni > 6) acc6 = _mm256_fmadd_ps(_mm256_broadcast_ss(w0 + 6 * (size_t)K + k), xv, acc6);
+                if (ni > 7) acc7 = _mm256_fmadd_ps(_mm256_broadcast_ss(w0 + 7 * (size_t)K + k), xv, acc7);
             }
             __m256 vones = _mm256_set1_ps(1.0f);
             for (int i = 0; i < ni; i++) {
                 __m256 v = (i == 0) ? acc0 : (i == 1) ? acc1 : (i == 2) ? acc2 :
-                           (i == 3) ? acc3 : (i == 4) ? acc4 : acc5;
+                           (i == 3) ? acc3 : (i == 4) ? acc4 : (i == 5) ? acc5 :
+                           (i == 6) ? acc6 : acc7;
                 if (bias) v = _mm256_add_ps(v, _mm256_set1_ps(bias[n0 + i]));
                 if (silu) {
                     // 向量化 fast_exp（Schraudolph）：钳制必须远离 -87.99 毒区
@@ -545,7 +551,7 @@ static inline void gemm_nm_core(const float* X, const float* W, const float* bia
         }
         // m β����������
         for (; m < m1; m++) {
-            float s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0;
+            float s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0, s7 = 0;
             for (int k = 0; k < K; k++) {
                 float xv = X[(size_t)k * M + m];
                 s0 += w0[k] * xv;
@@ -554,8 +560,10 @@ static inline void gemm_nm_core(const float* X, const float* W, const float* bia
                 if (ni > 3) s3 += w0[3 * (size_t)K + k] * xv;
                 if (ni > 4) s4 += w0[4 * (size_t)K + k] * xv;
                 if (ni > 5) s5 += w0[5 * (size_t)K + k] * xv;
+                if (ni > 6) s6 += w0[6 * (size_t)K + k] * xv;
+                if (ni > 7) s7 += w0[7 * (size_t)K + k] * xv;
             }
-            float sv[6] = { s0, s1, s2, s3, s4, s5 };
+            float sv[8] = { s0, s1, s2, s3, s4, s5, s6, s7 };
             for (int i = 0; i < ni; i++) {
                 float v = sv[i] + (bias ? bias[n0 + i] : 0.0f);
                 if (silu) v = v / (1.0f + fast_exp(-v));
@@ -748,13 +756,13 @@ static inline void gemm_nm(const float* X, const float* W, const float* bias,
     else if (lanes == 4 && K >= 32) Wp = get_packed_W4(W, N, K);
 
     size_t xbytes = (size_t)K * M * sizeof(float);
-    int CH = lanes ? lanes : 6;
+    int CH = lanes ? lanes : 8;
     if (!Wp && xbytes <= (2u << 20)) {
         while (CH > 1 && (N + CH - 1) / CH < workers * 2) CH--;
     }
     int nb = (N + CH - 1) / CH;
     int mb = 1;
-    while (nb * mb < workers * 2 && mb < 8 && (M / (mb * 2)) >= 64) mb *= 2;
+    while (nb * mb < workers * 2 && mb < 32 && (M / (mb * 2)) >= 64) mb *= 2;
     int m_chunk = ((M + mb - 1) / mb + 7) & ~7;
     int m_blocks = (M + m_chunk - 1) / m_chunk;
     int tasks = nb * m_blocks;
@@ -1860,15 +1868,13 @@ static inline void op_conv(const Tensor& input, const Tensor& weight, const Tens
         int M = outH * outW;
         size_t col_numel = (size_t)N * M * col_size;
         size_t group_input_numel = (size_t)N * C_per_group * H * W;
-        size_t max_numel = col_numel > group_input_numel ? col_numel : group_input_numel;
 
-        float* col = get_temp_buf(max_numel);
-        float* group_input = col + col_numel;  // ���û������ĺ�벿�֣��������
-        bool need_separate = (col_numel + group_input_numel > max_numel);
-        if (need_separate) {
-            // �����󣬵�������
-            group_input = (float*)malloc(group_input_numel * sizeof(float));
-        }
+        float* col = get_temp_buf(col_numel);
+        // 分组输入缓冲与 col 的生命周期重叠，必须独立分配。
+        // 旧代码取 max_numel = max(a,b)，再判 a+b > max(a,b) —— 该条件恒真，
+        // 实际一直走 malloc；但 col 白分配了 max_numel 的 temp buffer。
+        float* group_input = (float*)malloc(group_input_numel * sizeof(float));
+        if (!group_input) throw std::bad_alloc();
 
         for (int g = 0; g < group; g++) {
             // ��ȡ���������?
@@ -1899,7 +1905,7 @@ static inline void op_conv(const Tensor& input, const Tensor& weight, const Tens
                 }
             }
         }
-        if (need_separate) free(group_input);
+        free(group_input);
     }
 }
 

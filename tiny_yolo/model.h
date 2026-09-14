@@ -70,6 +70,7 @@ public:
     // 初始化线程池（32/64 位都启用；32 位限制线程数以节约地址空间）
     static void init_thread_pool() {
         int nth = (int)std::thread::hardware_concurrency();
+        if (nth > 1) nth--;  // 主线程也参与 parallel_for，减 1 避免超订
 #ifdef _WIN64
         nth = std::min(nth, 16);
 #else
@@ -404,22 +405,31 @@ public:
                             }
                             size_t numel = 1;
                             for (int s : ti.shape) numel *= s;
-                            // 统一存储为float（4字节），int64转换为float
-                            ti.dtype = 0; // FLOAT
+                            // 保留原始 dtype：Reshape/Slice/Reduce 等消费方按 dtype 决定读取宽度，
+                            // 把 int64 统一降成 float 会让它们按 8 字节错读（静默出错图）
+                            int dt = (int)a.t.data_type;
                             size_t elem_size = 4;
+                            if (dt == onnx_lite::TENSOR_INT64) elem_size = 8;
+                            else if (dt != onnx_lite::TENSOR_INT32) dt = 0; // 其余按 FLOAT 存储
+                            ti.dtype = (uint8_t)dt;
                             ti.data_offset = (uint32_t)weights_data.size();
                             size_t old = weights_data.size();
                             weights_data.resize(old + numel * elem_size);
-                            float* dst = (float*)(weights_data.data() + old);
-                            if (!a.t.float_data.empty()) {
-                                for (size_t i = 0; i < numel && i < a.t.float_data.size(); i++) dst[i] = a.t.float_data[i];
-                            } else if (!a.t.int64_data.empty()) {
-                                for (size_t i = 0; i < numel && i < a.t.int64_data.size(); i++) dst[i] = (float)a.t.int64_data[i];
-                            } else if (!a.t.raw_data.empty()) {
-                                if (a.t.data_type == onnx_lite::TENSOR_INT64) {
-                                    const int64_t* src = (const int64_t*)a.t.raw_data.data();
-                                    for (size_t i = 0; i < numel; i++) dst[i] = (float)src[i];
-                                } else {
+                            uint8_t* dstb = weights_data.data() + old;
+                            if (dt == onnx_lite::TENSOR_INT64) {
+                                int64_t* dst = (int64_t*)dstb;
+                                if (!a.t.int64_data.empty()) {
+                                    for (size_t i = 0; i < numel && i < a.t.int64_data.size(); i++) dst[i] = a.t.int64_data[i];
+                                } else if (!a.t.raw_data.empty()) {
+                                    memcpy(dst, a.t.raw_data.data(), std::min(numel * 8, a.t.raw_data.size()));
+                                }
+                            } else {
+                                float* dst = (float*)dstb;
+                                if (!a.t.float_data.empty()) {
+                                    for (size_t i = 0; i < numel && i < a.t.float_data.size(); i++) dst[i] = a.t.float_data[i];
+                                } else if (!a.t.int64_data.empty()) {
+                                    for (size_t i = 0; i < numel && i < a.t.int64_data.size(); i++) dst[i] = (float)a.t.int64_data[i];
+                                } else if (!a.t.raw_data.empty()) {
                                     memcpy(dst, a.t.raw_data.data(), std::min(numel * 4, a.t.raw_data.size()));
                                 }
                             }
@@ -497,7 +507,8 @@ public:
         output_tensor_ids.clear();
         for (const auto& nm : output_names) {
             auto it = n2id.find(nm);
-            output_tensor_ids.push_back(it != n2id.end() ? it->second : (uint16_t)0);
+            // 0xFFFF = 未解析。用 0 会指向第一个输入张量，get_output 会返回错张量
+            output_tensor_ids.push_back(it != n2id.end() ? it->second : (uint16_t)0xFFFF);
         }
 
         if (tyro_log_enabled())
@@ -548,7 +559,8 @@ public:
         if (idx < 0 || idx >= (int)output_names.size()) return nullptr;
         if (idx < (int)output_tensor_ids.size()) {
             uint16_t tid = output_tensor_ids[idx];
-            return (tid < tensors.size()) ? &tensors[tid] : nullptr;
+            if (tid == (uint16_t)0xFFFF || tid >= tensors.size()) return nullptr;
+            return &tensors[tid];
         }
         // 杈撳嚭寮犻噺閫氬父鍦ㄥ紶閲忚〃鐨勫悗闈紝鎸夊悕瀛楁煡鎵?
         // 绠€鍖栵細閬嶅巻鎵炬渶鍚庡嚑涓潪甯搁噺寮犻噺
@@ -848,8 +860,8 @@ private:
                         const int32_t* sd = (const int32_t*)shape_tensor.data;
                         for (int i = 0; i < shape_tensor.numel; i++) new_shape[i] = (int)sd[i];
                     } else {
-                        // 默认按int64解析
-                        const int64_t* sd = (const int64_t*)shape_tensor.data;
+                        // FLOAT 存储（或未标注 dtype）：按 4 字节读，不能当 int64 解释
+                        const float* sd = shape_tensor.data;
                         for (int i = 0; i < shape_tensor.numel; i++) new_shape[i] = (int)sd[i];
                     }
                     Tensor& input = tensors[op.input_ids[0]];
@@ -919,7 +931,7 @@ private:
                 auto read_int_tensor = [](Tensor& t, std::vector<int>& out) {
                     if (t.dtype == 7) { const int64_t* p = (const int64_t*)t.data; for (int i = 0; i < t.numel; i++) out.push_back((int)p[i]); }
                     else if (t.dtype == 6) { const int32_t* p = (const int32_t*)t.data; for (int i = 0; i < t.numel; i++) out.push_back((int)p[i]); }
-                    else { const int64_t* p = (const int64_t*)t.data; for (int i = 0; i < t.numel; i++) out.push_back((int)p[i]); }
+                    else { const float* p = t.data; for (int i = 0; i < t.numel; i++) out.push_back((int)p[i]); }
                 };
                 if (op.input_ids.size() > 1) read_int_tensor(tensors[op.input_ids[1]], starts);
                 if (op.input_ids.size() > 2) read_int_tensor(tensors[op.input_ids[2]], ends);
@@ -957,8 +969,8 @@ private:
                         const int32_t* p = (const int32_t*)axes_tensor.data;
                         for (int i = 0; i < axes_tensor.numel; i++) axes.push_back((int)p[i]);
                     } else {
-                        // 默认按int64解析
-                        const int64_t* p = (const int64_t*)axes_tensor.data;
+                        // FLOAT 存储：按 4 字节读
+                        const float* p = axes_tensor.data;
                         for (int i = 0; i < axes_tensor.numel; i++) axes.push_back((int)p[i]);
                     }
                 }

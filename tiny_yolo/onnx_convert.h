@@ -174,6 +174,21 @@ static inline int fuse_conv_silu(std::vector<onnx_lite::OnnxNode>& nodes) {
         }
         if (mul_idx < 0) continue;
 
+        // use-count guard: conv_out must be consumed exactly twice
+        // (Sigmoid + Mul) and sigmoid_out exactly once (Mul). Otherwise the Conv
+        // output feeds another branch (residual/Concat) and renaming it breaks.
+        {
+            int conv_uses = 0, sig_uses = 0;
+            for (size_t j = 0; j < nodes.size(); j++) {
+                if (removed[j]) continue;
+                for (const auto& in : nodes[j].inputs) {
+                    if (in == conv_out) conv_uses++;
+                    if (in == sigmoid_out) sig_uses++;
+                }
+            }
+            if (conv_uses != 2 || sig_uses != 1) continue;
+        }
+
         // 融合：把Conv改成ConvSiLU，输出改成Mul的输出
         nodes[i].op_type = "ConvSiLU";
         nodes[i].outputs[0] = nodes[mul_idx].outputs[0];
@@ -258,11 +273,36 @@ static inline int fuse_softmax(std::vector<onnx_lite::OnnxNode>& nodes) {
         }
         if (div_idx < 0) continue;
 
+        // use-count guard: all four intermediates must have exactly one
+        // consumer, else deleting these nodes leaves a branch with no producer.
+        {
+            auto uses_of = [&](const std::string& nm) {
+                int n = 0;
+                for (size_t j = 0; j < nodes.size(); j++) {
+                    if (removed[j]) continue;
+                    for (const auto& in : nodes[j].inputs) if (in == nm) n++;
+                }
+                return n;
+            };
+            if (uses_of(rm_out) != 1 || uses_of(sub_out) != 1
+                || uses_of(exp_out) != 1 || uses_of(rs_out) != 1) continue;
+        }
+
         // 融合：把ReduceMax改成Softmax，输出改成Div的输出
         // Softmax的输入是Sub的第一个输入（原始输入）
         std::string softmax_input = nodes[sub_idx].inputs[0];
         if (softmax_input == rm_out) softmax_input = nodes[sub_idx].inputs[1];
         nodes[i].op_type = "Softmax";
+        // The original ReduceMax carries axes/keepdims, but op_softmax looks
+        // for "axis" and breaks on the first other attribute - set it here.
+        nodes[i].attributes.clear();
+        {
+            onnx_lite::OnnxNode::Attribute ax;
+            ax.name = "axis";
+            ax.type = 2; // INT
+            ax.ints = { -1 };
+            nodes[i].attributes.push_back(std::move(ax));
+        }
         nodes[i].inputs[0] = softmax_input;
         nodes[i].outputs[0] = nodes[div_idx].outputs[0];
         removed[sub_idx] = true;
