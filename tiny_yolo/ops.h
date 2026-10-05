@@ -25,6 +25,22 @@
 // ǰ���������������·�"�����"�½ڣ�
 static inline float fast_exp(float x);
 
+// Vectorized Schraudolph exp approximation, identical to the clamped fast_exp
+// path: clamping must stay far from the -87.99 poison band (below it the
+// integer result goes negative and reinterprets as NaN). Used by every AVX2
+// SiLU/sigmoid/exp site so the fused and standalone ops stay bit-identical.
+static inline __m256 exp256_ps(__m256 x) {
+    x = _mm256_min_ps(x, _mm256_set1_ps(86.0f));
+    x = _mm256_max_ps(x, _mm256_set1_ps(-86.0f));
+    x = _mm256_fmadd_ps(x, _mm256_set1_ps(12102203.0f), _mm256_set1_ps(1064866805.0f));
+    return _mm256_castsi256_ps(_mm256_cvttps_epi32(x));
+}
+
+static inline __m256 silu256_ps(__m256 v) {
+    return _mm256_div_ps(v, _mm256_add_ps(_mm256_set1_ps(1.0f),
+                                         exp256_ps(_mm256_sub_ps(_mm256_setzero_ps(), v))));
+}
+
 // ============================================================
 // ���̳߳أ�ģ�ͼ���ʱ����������ʱ���ã������̴߳���/���ٿ�����
 // ���񷢲���ԭ�Ӵ�����release/acquire�������ѣ�ÿ worker һ���Զ������¼�
@@ -1637,22 +1653,38 @@ static inline void im2col_km(const float* input, float* output,
     for (int n = 0; n < N; n++) {
         const float* in_n = input + (size_t)n * C * H * W;
         float* col_n = output + (size_t)n * C * kH * kW * M;
+        // ceil(a/b) for a>0, else 0. iw = ow*strideW + iw_d stays in [0,W)
+        // over a contiguous ow range, so the valid window is computed once per
+        // (kh,kw) instead of branching on every output pixel.
+        auto ceil_pos = [](int a, int b) { return a > 0 ? (a + b - 1) / b : 0; };
         auto body = [&](int c) {
             const float* in_c = in_n + (size_t)c * H * W;
             for (int kh = 0; kh < kH; kh++) {
+                int ih_d = kh * dilationH - padH; // ih = oh*strideH + ih_d
                 for (int kw = 0; kw < kW; kw++) {
                     float* row = col_n + (((size_t)c * kH + kh) * kW + kw) * M;
+                    int iw_d = kw * dilationW - padW; // iw = ow*strideW + iw_d
+                    // ow in [ow_lo, ow_hi) maps inside the row; outside is zero-padding
+                    int ow_lo = std::min(outW, ceil_pos(-iw_d, strideW));
+                    int ow_hi = std::max(0, std::min(outW, ceil_pos(W - iw_d, strideW)));
                     for (int oh = 0; oh < outH; oh++) {
-                        int ih = oh * strideH - padH + kh * dilationH;
-                        const float* in_row = (ih >= 0 && ih < H) ? in_c + (size_t)ih * W : nullptr;
-                        int base = oh * outW;
-                        if (!in_row) {
-                            memset(row + base, 0, outW * sizeof(float));
+                        int ih = oh * strideH + ih_d;
+                        float* dst = row + (size_t)oh * outW;
+                        if (ih < 0 || ih >= H) {
+                            memset(dst, 0, outW * sizeof(float));
+                            continue;
+                        }
+                        const float* in_row = in_c + (size_t)ih * W;
+                        if (ow_lo > 0) memset(dst, 0, (size_t)ow_lo * sizeof(float));
+                        if (ow_hi < outW) memset(dst + ow_hi, 0, (size_t)(outW - ow_hi) * sizeof(float));
+                        int cnt = ow_hi - ow_lo;
+                        if (cnt <= 0) continue;
+                        if (strideW == 1 && dilationW == 1) {
+                            // interior columns are a plain contiguous copy
+                            memcpy(dst + ow_lo, in_row + (ow_lo + iw_d), (size_t)cnt * sizeof(float));
                         } else {
-                            for (int ow = 0; ow < outW; ow++) {
-                                int iw = ow * strideW - padW + kw * dilationW;
-                                row[base + ow] = (iw >= 0 && iw < W) ? in_row[iw] : 0.0f;
-                            }
+                            for (int ow = ow_lo; ow < ow_hi; ow++)
+                                dst[ow] = in_row[(size_t)ow * strideW + iw_d];
                         }
                     }
                 }
@@ -1927,32 +1959,60 @@ static inline float fast_exp(float x) {
 
 static inline void op_silu(const Tensor& input, Tensor& output) {
     output.alloc(input.shape);
-    for (int i = 0; i < input.numel; i++) {
-        float x = input.data[i];
+    const float* in = input.data;
+    float* out = output.data;
+    int i = 0;
+    for (; i + 8 <= input.numel; i += 8)
+        _mm256_storeu_ps(out + i, silu256_ps(_mm256_loadu_ps(in + i)));
+    for (; i < input.numel; i++) {
+        float x = in[i];
         // SiLU = x * sigmoid(x) = x / (1 + exp(-x))
-        output.data[i] = x / (1.0f + fast_exp(-x));
+        out[i] = x / (1.0f + fast_exp(-x));
     }
 }
 
 static inline void op_sigmoid(const Tensor& input, Tensor& output) {
     output.alloc(input.shape);
-    for (int i = 0; i < input.numel; i++) {
-        output.data[i] = 1.0f / (1.0f + fast_exp(-input.data[i]));
+    const float* in = input.data;
+    float* out = output.data;
+    const __m256 vones = _mm256_set1_ps(1.0f);
+    int i = 0;
+    for (; i + 8 <= input.numel; i += 8) {
+        __m256 e = exp256_ps(_mm256_sub_ps(_mm256_setzero_ps(), _mm256_loadu_ps(in + i)));
+        _mm256_storeu_ps(out + i, _mm256_div_ps(vones, _mm256_add_ps(vones, e)));
     }
+    for (; i < input.numel; i++)
+        out[i] = 1.0f / (1.0f + fast_exp(-in[i]));
 }
 
 static inline void op_relu(const Tensor& input, Tensor& output) {
     output.alloc(input.shape);
-    for (int i = 0; i < input.numel; i++) {
-        output.data[i] = input.data[i] > 0 ? input.data[i] : 0;
-    }
+    const float* in = input.data;
+    float* out = output.data;
+    const __m256 vzero = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= input.numel; i += 8)
+        _mm256_storeu_ps(out + i, _mm256_max_ps(_mm256_loadu_ps(in + i), vzero));
+    for (; i < input.numel; i++)
+        out[i] = in[i] > 0 ? in[i] : 0;
 }
 
 static inline void op_exp(const Tensor& input, Tensor& output) {
     output.alloc(input.shape);
-    for (int i = 0; i < input.numel; i++) {
-        output.data[i] = fast_exp(input.data[i]);
+    const float* in = input.data;
+    float* out = output.data;
+    int i = 0;
+    const __m256 vhi = _mm256_set1_ps(86.0f), vlo = _mm256_set1_ps(-86.0f);
+    for (; i + 8 <= input.numel; i += 8) {
+        __m256 xv = _mm256_loadu_ps(in + i);
+        __m256 e = exp256_ps(xv);
+        // keep scalar fast_exp semantics at the clamps: x>86 -> 1e30, x<-86 -> 0
+        e = _mm256_blendv_ps(e, _mm256_set1_ps(1e30f), _mm256_cmp_ps(xv, vhi, _CMP_GT_OQ));
+        e = _mm256_blendv_ps(e, _mm256_setzero_ps(), _mm256_cmp_ps(xv, vlo, _CMP_LT_OQ));
+        _mm256_storeu_ps(out + i, e);
     }
+    for (; i < input.numel; i++)
+        out[i] = fast_exp(in[i]);
 }
 
 // ============================================================
@@ -2086,9 +2146,27 @@ static inline void op_elementwise(const Tensor& a, const Tensor& b, Tensor& outp
     }
 
     // ͨ��·�����㲥
+    // Odometer walk: keep running flat offsets into a and b instead of calling
+    // broadcast_index() (ndim div/mod ops) for every output element.
+    int nd = (int)out_shape.size();
+    int off_a = nd - a.ndim, off_b = nd - b.ndim;
+    std::vector<int> as(nd, 0), bs(nd, 0);
+    { // input-flat strides per output dim (0 where the dim broadcasts)
+        int s = 1;
+        for (int i = a.ndim - 1; i >= 0; i--) {
+            if (a.shape[i] > 1) as[i + off_a] = s;
+            s *= a.shape[i];
+        }
+        s = 1;
+        for (int i = b.ndim - 1; i >= 0; i--) {
+            if (b.shape[i] > 1) bs[i + off_b] = s;
+            s *= b.shape[i];
+        }
+    }
+    std::vector<int> idx(nd, 0);
+    int ai = 0, bi = 0;
     for (int i = 0; i < output.numel; i++) {
-        float va = read_tensor_val(a, broadcast_index(i, out_shape, a.shape));
-        float vb = read_tensor_val(b, broadcast_index(i, out_shape, b.shape));
+        float va = read_tensor_val(a, ai), vb = read_tensor_val(b, bi);
         float r = 0;
         switch (op) {
             case '+': r = va + vb; break;
@@ -2097,6 +2175,12 @@ static inline void op_elementwise(const Tensor& a, const Tensor& b, Tensor& outp
             case '/': r = va / vb; break;
         }
         output.data[i] = r;
+        for (int d = nd - 1; d >= 0; d--) {
+            ai += as[d]; bi += bs[d];
+            if (++idx[d] < out_shape[d]) break;
+            ai -= as[d] * out_shape[d]; bi -= bs[d] * out_shape[d];
+            idx[d] = 0;
+        }
     }
 }
 
@@ -2656,30 +2740,43 @@ static inline void op_slice(const Tensor& input, Tensor& output,
     }
     output.alloc(out_shape);
 
-    // ��ʵ�֣���Ԫ�ظ���
-    for (int i = 0; i < output.numel; i++) {
-        // �����ƽ����?-> �����ά����?
-        int idx = i;
-        std::vector<int> out_idx(output.ndim);
-        for (int d = output.ndim - 1; d >= 0; d--) {
-            out_idx[d] = idx % output.shape[d];
-            idx /= output.shape[d];
+    // Per-dim start/step on input dims (unsliced dims keep start=0, step=1)
+    std::vector<int> dstart(input.ndim, 0), dstep(input.ndim, 1);
+    int last_sliced = -1;
+    for (size_t j = 0; j < axes.size(); j++) {
+        int ax = axes[j] < 0 ? axes[j] + input.ndim : axes[j];
+        dstart[ax] = norm_starts[j];
+        dstep[ax] = j < steps.size() ? steps[j] : 1;
+        if (ax > last_sliced) last_sliced = ax;
+    }
+
+    // Trailing dims after the last sliced axis are copied contiguously:
+    // index over the prefix dims with an odometer, memcpy each inner block.
+    // (The old per-element path allocated two vectors + did div/mod per item.)
+    int inner = 1;
+    for (int d = last_sliced + 1; d < input.ndim; d++) inner *= output.shape[d];
+    int pd = last_sliced + 1; // number of dims walked by the odometer
+
+    std::vector<int> in_strides(input.ndim);
+    {
+        int s = 1;
+        for (int d = input.ndim - 1; d >= 0; d--) { in_strides[d] = s; s *= input.shape[d]; }
+    }
+    std::vector<int> idx(pd, 0);
+    size_t in_flat = 0;
+    for (int d = 0; d < pd; d++) in_flat += (size_t)dstart[d] * in_strides[d];
+
+    int outer_numel = (inner > 0) ? output.numel / inner : 0;
+    for (int o = 0; o < outer_numel; o++) {
+        memcpy(output.data + (size_t)o * inner, input.data + in_flat,
+               (size_t)inner * sizeof(float));
+        // advance the odometer over dims [0, pd)
+        for (int d = pd - 1; d >= 0; d--) {
+            in_flat += (size_t)dstep[d] * in_strides[d];
+            if (++idx[d] < output.shape[d]) break;
+            in_flat -= (size_t)output.shape[d] * dstep[d] * in_strides[d];
+            idx[d] = 0;
         }
-        // ת��Ϊ��������
-        std::vector<int> in_idx = out_idx;
-        for (size_t j = 0; j < axes.size(); j++) {
-            int ax = axes[j] < 0 ? axes[j] + input.ndim : axes[j];
-            int step = j < steps.size() ? steps[j] : 1;
-            in_idx[ax] = norm_starts[j] + out_idx[ax] * step;
-        }
-        // ���������ƽ����?
-        int in_flat = 0;
-        int stride = 1;
-        for (int d = input.ndim - 1; d >= 0; d--) {
-            in_flat += in_idx[d] * stride;
-            stride *= input.shape[d];
-        }
-        output.data[i] = input.data[in_flat];
     }
 }
 
@@ -2911,21 +3008,65 @@ static inline void op_maxpool(const Tensor& input, Tensor& output,
     int outW = (W + padW * 2 - kW) / strideW + 1;
     output.alloc({N, C, outH, outW});
 
+    // All taps valid: iw = ow*strideW - padW + kw in [0,W) for every kw in
+    // [0,kW) requires ow in [ow_lo, ow_hi); similarly for ih per row. Interior
+    // windows run branch-free AVX2, edges keep the per-tap bounds check.
+    auto ceil_pos = [](int a, int b) { return a > 0 ? (a + b - 1) / b : 0; };
+    int ow_lo = std::min(outW, ceil_pos(padW, strideW));
+    // ow*strideW - padW + kW-1 <= W-1  <=>  ow <= (W+padW-kW)/strideW
+    int ow_hi = std::max(0, std::min(outW, (W + padW - kW) / strideW + 1));
+
+    auto scalar_row = [&](const float* in_c, float* out_row, int oh, int o0, int o1) {
+        for (int ow = o0; ow < o1; ow++) {
+            float max_val = -1e30f;
+            for (int kh = 0; kh < kH; kh++) {
+                int ih = oh * strideH - padH + kh;
+                if (ih < 0 || ih >= H) continue;
+                const float* r = in_c + (size_t)ih * W;
+                for (int kw = 0; kw < kW; kw++) {
+                    int iw = ow * strideW - padW + kw;
+                    if (iw >= 0 && iw < W) max_val = std::max(max_val, r[iw]);
+                }
+            }
+            out_row[ow] = max_val;
+        }
+    };
+
+    const __m256 vneg = _mm256_set1_ps(-1e30f);
     for (int n = 0; n < N; n++) {
         for (int c = 0; c < C; c++) {
+            const float* in_c = input.data + ((size_t)n * C + c) * H * W;
+            float* out_c = output.data + ((size_t)n * C + c) * outH * outW;
             for (int oh = 0; oh < outH; oh++) {
-                for (int ow = 0; ow < outW; ow++) {
-                    float max_val = -1e30f;
-                    for (int kh = 0; kh < kH; kh++) {
-                        for (int kw = 0; kw < kW; kw++) {
-                            int ih = oh * strideH - padH + kh;
-                            int iw = ow * strideW - padW + kw;
-                            if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                                max_val = std::max(max_val, input.at(n, c, ih, iw));
-                            }
+                float* out_row = out_c + (size_t)oh * outW;
+                int ih_min = oh * strideH - padH;
+                int ih_max = ih_min + kH - 1;
+                if (ih_min >= 0 && ih_max < H && ow_hi > ow_lo) {
+                    // left/right edges with partial kernel coverage
+                    scalar_row(in_c, out_row, oh, 0, ow_lo);
+                    scalar_row(in_c, out_row, oh, ow_hi, outW);
+                    int ow = ow_lo;
+                    for (; ow + 8 <= ow_hi; ow += 8) {
+                        __m256 m = vneg;
+                        for (int kh = 0; kh < kH; kh++) {
+                            const float* r = in_c + (size_t)(ih_min + kh) * W + (ow * strideW - padW);
+                            for (int kw = 0; kw < kW; kw++)
+                                m = _mm256_max_ps(m, _mm256_loadu_ps(r + kw));
                         }
+                        _mm256_storeu_ps(out_row + ow, m);
                     }
-                    output.at(n, c, oh, ow) = max_val;
+                    // interior tail: all taps valid, no bounds checks needed
+                    for (; ow < ow_hi; ow++) {
+                        float max_val = -1e30f;
+                        for (int kh = 0; kh < kH; kh++) {
+                            const float* r = in_c + (size_t)(ih_min + kh) * W + (ow * strideW - padW);
+                            for (int kw = 0; kw < kW; kw++)
+                                max_val = std::max(max_val, r[kw]);
+                        }
+                        out_row[ow] = max_val;
+                    }
+                } else {
+                    scalar_row(in_c, out_row, oh, 0, outW);
                 }
             }
         }

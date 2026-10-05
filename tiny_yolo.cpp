@@ -71,7 +71,7 @@ static inline float iou(const Box& a, const Box& b) {
     if (x2 <= x1 || y2 <= y1) return 0.0f;
     float interArea = (x2 - x1) * (y2 - y1);
     float unionArea = a.w * a.h + b.w * b.h - interArea;
-    return interArea / unionArea;
+    return unionArea > 0 ? interArea / unionArea : 0.0f;
 }
 
 // 璋冭瘯瀹?
@@ -166,8 +166,11 @@ extern "C" __declspec(dllexport) int __stdcall YoloDetectFromMemory(
             printf("[det] img=%dx%d scale=%.4f pad=%d,%d raw_box@3392 will follow\n",
                    w, h, scale, pad_w, pad_h);
 
-        unsigned char* resized = (unsigned char*)malloc((size_t)new_w * new_h * 3);
-        if (!resized) { stbi_image_free(img); return 0; }
+        // reused across frames instead of malloc/free per call
+        static thread_local std::vector<unsigned char> resized_buf;
+        resized_buf.resize((size_t)new_w * new_h * 3);
+        unsigned char* resized = resized_buf.data();
+        if (new_w * new_h > 0 && !resized) { stbi_image_free(img); return 0; }
         stbir_resize_uint8_linear(img, w, h, 0, resized, new_w, new_h, 0, (stbir_pixel_layout)3);
         stbi_image_free(img);
 
@@ -214,7 +217,6 @@ extern "C" __declspec(dllexport) int __stdcall YoloDetectFromMemory(
                 ptr_b[dst] = lut.v[resized[src + 2]];
             }
         }
-        free(resized);
         // 4. 璁剧疆杈撳叆骞舵墽琛?
         g_model->set_input(0, {1, 3, g_input_h, g_input_w}, tensor_data.data());
         if (!g_model->run()) { return 0; }
@@ -270,7 +272,8 @@ extern "C" __declspec(dllexport) int __stdcall YoloDetectFromMemory(
                        out_data[(size_t)2 * cols + 3312], out_data[(size_t)3 * cols + 3312]);
             }
         }
-        std::vector<Box> boxes;
+        static thread_local std::vector<Box> boxes;
+        boxes.clear();
 
         if (is_v26_format) {
             // YOLOv26鏍煎紡锛歔1, num_dets, 6]锛屾瘡涓娴媅x1,y1,x2,y2,conf,cls]
@@ -314,21 +317,35 @@ extern "C" __declspec(dllexport) int __stdcall YoloDetectFromMemory(
         // Reused across frames instead of allocating ~67KB on every call.
         static thread_local std::vector<float> best_score;
         static thread_local std::vector<int> best_cls;
-        best_score.resize(num_anchors);
-        best_cls.resize(num_anchors);
+        best_score.assign(num_anchors, 0.0f);
+        best_cls.assign(num_anchors, 0);
+        // Row-major argmax: sweep each class row contiguously and blend in
+        // improvements, instead of a per-anchor column scan that strided
+        // num_anchors floats between reads (cache-hostile for 80+ classes).
+        const float* cls_base = out_data + 4 * (size_t)num_anchors;
+        for (int c = 0; c < classes; ++c) {
+            const float* row = cls_base + (size_t)c * num_anchors;
+            __m256i vc = _mm256_set1_epi32(c);
+            int i = 0;
+            for (; i + 8 <= num_anchors; i += 8) {
+                __m256 s = _mm256_loadu_ps(row + i);
+                __m256 best = _mm256_loadu_ps(best_score.data() + i);
+                __m256 mask = _mm256_cmp_ps(s, best, _CMP_GT_OQ); // strict > keeps first-max class
+                _mm256_storeu_ps(best_score.data() + i, _mm256_blendv_ps(best, s, mask));
+                __m256i bi = _mm256_loadu_si256((const __m256i*)(best_cls.data() + i));
+                _mm256_storeu_si256((__m256i*)(best_cls.data() + i),
+                                    _mm256_blendv_epi8(bi, vc, _mm256_castps_si256(mask)));
+            }
+            for (; i < num_anchors; ++i) {
+                float s = row[i];
+                if (s > best_score[i]) { best_score[i] = s; best_cls[i] = c; }
+            }
+        }
         int active_anchors = 0;
         int tiny_scores = 0; // anchors with peak class score <= 1e-4 (v10 bg)
         for (int i = 0; i < num_anchors; ++i) {
-            float max_score = 0;
-            int class_id = 0;
-            for (int c = 0; c < classes; ++c) {
-                float s = out_data[(4 + c) * num_anchors + i];
-                if (s > max_score) { max_score = s; class_id = c; }
-            }
-            best_score[i] = max_score;
-            best_cls[i] = class_id;
-            if (max_score > 0.01f) active_anchors++;
-            if (max_score <= 1e-4f) tiny_scores++;
+            if (best_score[i] > 0.01f) active_anchors++;
+            if (best_score[i] <= 1e-4f) tiny_scores++;
         }
 
         // V10 鍒ゅ畾锛堝弻閲嶉獙璇侊紝闃茶鍒わ級锛?
@@ -389,7 +406,8 @@ extern "C" __declspec(dllexport) int __stdcall YoloDetectFromMemory(
         std::sort(boxes.begin(), boxes.end(), [](const Box& a, const Box& b) { return a.score > b.score; });
 
         int valid_count = 0;
-        std::vector<bool> sup(boxes.size(), false);
+        static thread_local std::vector<char> sup;
+        sup.assign(boxes.size(), 0);
         for (size_t i = 0; i < boxes.size(); ++i) {
             if (sup[i]) continue;
             if (valid_count >= max_size) break;
