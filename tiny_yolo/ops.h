@@ -3046,14 +3046,23 @@ static inline void op_maxpool(const Tensor& input, Tensor& output,
                     scalar_row(in_c, out_row, oh, 0, ow_lo);
                     scalar_row(in_c, out_row, oh, ow_hi, outW);
                     int ow = ow_lo;
-                    for (; ow + 8 <= ow_hi; ow += 8) {
-                        __m256 m = vneg;
-                        for (int kh = 0; kh < kH; kh++) {
-                            const float* r = in_c + (size_t)(ih_min + kh) * W + (ow * strideW - padW);
-                            for (int kw = 0; kw < kW; kw++)
-                                m = _mm256_max_ps(m, _mm256_loadu_ps(r + kw));
+                    // The AVX2 path loads 8 CONSECUTIVE input columns, so lane i
+                    // reads in[base+kw+i] while output ow+i actually needs
+                    // iw = (ow+i)*strideW - padW + kw. Those are only equivalent
+                    // when strideW == 1 (every target model's SPPF is 5x5 s1 p2,
+                    // which is why this went unnoticed). For strideW > 1 fall
+                    // through to the scalar tail, which recomputes the base row
+                    // pointer per output column.
+                    if (strideW == 1) {
+                        for (; ow + 8 <= ow_hi; ow += 8) {
+                            __m256 m = vneg;
+                            for (int kh = 0; kh < kH; kh++) {
+                                const float* r = in_c + (size_t)(ih_min + kh) * W + (ow * strideW - padW);
+                                for (int kw = 0; kw < kW; kw++)
+                                    m = _mm256_max_ps(m, _mm256_loadu_ps(r + kw));
+                            }
+                            _mm256_storeu_ps(out_row + ow, m);
                         }
-                        _mm256_storeu_ps(out_row + ow, m);
                     }
                     // interior tail: all taps valid, no bounds checks needed
                     for (; ow < ow_hi; ow++) {
