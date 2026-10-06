@@ -117,6 +117,14 @@ cl /O2 /EHsc test_fixes.cpp /Fetest_fixes.exe
 test_fixes.exe          :: 同目录需有 1.jpg / tall.jpg 与用到的 .onnx
 ```
 
+`test_vec.cpp` 是**向量化算子的对拍单测**：把每个 AVX2 算子与标量参考实现逐元素比较，
+不需要 DLL 和模型文件：
+
+```bat
+cl /O2 /EHsc /arch:AVX2 test_vec.cpp /Fetest_vec.exe
+test_vec.exe            :: maxpool(含 strided) / silu / sigmoid / relu / exp / 广播
+```
+
 | 用例 | 覆盖的缺陷 |
 |------|-----------|
 | T1 | `ReleaseModel` 后换模型，被上一次 `SetInputSize` 残留的尺寸静默拦截（永久 0 检出） |
@@ -260,7 +268,18 @@ test_s2.cpp / test_wino.cpp（卷积内核对拍测试）、test_initmem.cpp（�
 - 非 packed 路径 `CH` 6 → 8；`mb` 上限 8 → 32（12 线程不再有空转）
 - 线程数改为 `hardware_concurrency() - 1`（主线程也参与 `parallel_for`，避免超订）
 
-> 注：本轮性能改动**未取得可信的 A/B 结论**。同机对照中同一个基线 DLL 在不同轮次测出 117ms 与 128ms（约 9% 漂移），大于预期收益；`NB`/`CH` 同值这条是唯一在两轮对照中方向一致的结论。检出框与修复前逐位一致，无精度退化。
+> 注：提交时**未取得可信的 A/B 结论**（同一个基线 DLL 在不同轮次测出 117ms 与 128ms，约 9% 漂移）。
+> 后用三轮交替 A/B 复测（main vs 本分支，同一时间窗口，取热态中位数）结论稳定：
+> **yolo11n@640 由 121.5ms 降至 111ms（约 -8.6%）**；256 输入的自定义大模型基本持平
+> （~108ms；该规模下卷积占绝对主导，向量化的都是轻量算子）。检出框与修改前逐位一致。
+
+</details>
+
+<details>
+<summary><b>已修复的向量化 Bug（2026-10-06）</b></summary>
+
+- **`op_maxpool` 的 AVX2 快路径在 `strideW > 1` 时算错**：向量内层用 `_mm256_loadu_ps(r + kw)` 连续载入 8 个**输入**列，而车道 i 本应取 `iw = (ow+i)*strideW - padW + kw` —— 两者只在 `strideW == 1` 时等价。现有 5 个模型的 MaxPool 全是 SPPF 的 5x5 s1 p2，所以一直没暴露；换任何含 stride>1 MaxPool 的模型（YOLOv5 系 SPP、自定义模型）会**静默算错**。现在 `strideW != 1` 直接落到标量路径。`test_vec.cpp` 实测：2x2 s2 p0 由 106/128 错 → **0**，3x3 s2 p1 由 89/256 错 → **0**，5x5 s1 p2 保持不变。
+- 另注（非缺陷）：AVX2 的 exp 近似走 FMA（单次舍入），标量 `fast_exp` 走 mul+add（两次舍入），在 `x ≈ 25` 附近二者相对差可达 ~1e-4（该处 float 中间量约 1.4e9，1 ULP 本身就有 128）。这是近似算法固有性质、早于本轮改动（6 处 AVX2 exp 站点一直如此），对结果无可见影响（检出框逐位一致），故保留 FMA、不动这些热路径；`test_vec.cpp` 对激活用 1e-4 容差而非逐位相等。
 
 </details>
 
@@ -281,11 +300,12 @@ convert_model.py      ONNX → .tyro 转换器
 stb_image.h           图片解码
 test_tiny.cpp         测试程序
 test_fixes.cpp        Bug 回归测试（17 项，见"回归测试"一节）
+test_vec.cpp          向量化算子对拍单测（maxpool strided / 激活 / 广播）
 tall.jpg              回归测试 T4 用的极端宽高比图（320x800）
 易语言_YOLO识别模块.txt  易语言模块源码(导入即用)
 易语言_使用示例.txt      易语言三行用法示例
 YOLO推理引擎.ec        编译好的易语言模块
-tiny_yolo_x86.dll     预编译 x86 DLL (/MT+UPX, 213KB)
+tiny_yolo_x86.dll     预编译 x86 DLL (/MT+UPX, 218KB)
 tiny_yolo.dll         预编译 x64 DLL (/MT+UPX, 251KB)
 ```
 
